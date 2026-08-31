@@ -63,29 +63,43 @@ if "show_explanation" not in st.session_state:
 if "is_correct" not in st.session_state:
     st.session_state.is_correct = None
 
+from urllib.parse import urlparse, parse_qs
 
 def extract_youtube_id(url: str) -> str:
-    """Извлекает ID видео из любой ссылки YouTube"""
-    pattern = r'(?:v=|\/([0-9A-Za-z_-]{11}).*|youtu\.be\/)([0-9A-Za-z_-]{11})'
-    match = re.search(pattern, url)
-    if match:
-        return match.group(1) or match.group(2)
+    """Надежно извлекает ID видео из любых ссылок YouTube"""
+    parsed = urlparse(url)
+    if parsed.hostname in ('www.youtube.com', 'youtube.com'):
+        if parsed.path == '/watch':
+            return parse_qs(parsed.query).get('v', [None])[0]
+        if parsed.path.startswith(('/embed/', '/v/')):
+            return parsed.path.split('/')[2]
+    elif parsed.hostname == 'youtu.be':
+        return parsed.path.lstrip('/')
     return None
 
-
 def get_youtube_text(url: str):
-    """Извлекает субтитры из видео на YouTube"""
     video_id = extract_youtube_id(url)
     if not video_id:
         return None, "Некорректная ссылка на YouTube. Проверьте адрес."
+    
     try:
-        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
-        full_text = " ".join([item['text'] for item in transcript])
+        # Получаем список всех доступных языков для этого видео
+        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        
+        # Пробуем найти ручные или автоматические субтитры (ru, kk, en)
+        try:
+            transcript = transcript_list.find_transcript(['ru', 'kk', 'en'])
+        except:
+            # Если языки не совпали, берем самые первые доступные субтитры
+            transcript = transcript_list.find_generated_transcript(['ru', 'kk', 'en'])
+            
+        data = transcript.fetch()
+        full_text = " ".join([item['text'] for item in data])
         return full_text, None
-    except Exception:
-        return None, "Не удалось получить субтитры. Убедитесь, что у видео включены автосубтитры на YouTube."
-
-
+        
+    except Exception as e:
+        return None, f"Не удалось получить субтитры: у этого видео они отключены или заблокированы автором."
+        
 class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
