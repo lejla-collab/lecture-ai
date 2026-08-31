@@ -489,16 +489,16 @@ def main():
                 if os.path.exists(temp_audio_path):
                     os.remove(temp_audio_path)
 
-else:
-    youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по истории):")
-    if youtube_url and st.button("Начать обработку YouTube видео"):
-        with st.spinner("Gemini изучаeт видео... Это займет 10–15 секунд"):
-            result_text, error = process_youtube_with_gemini(youtube_url)
-            if error:
-                st.error(error)
-            else:
-                st.success("Конспект и проверка знаний готовы!")
-                st.markdown(result_text)
+        else:
+            youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по истории):")
+            if youtube_url and st.button("Начать обработку YouTube видео"):
+                with st.spinner("Gemini изучаeт видео... Это займет 10–15 секунд"):
+                    result_text, error = process_youtube_with_gemini(youtube_url)
+                    if error:
+                        st.error(error)
+                    else:
+                        st.success("Конспект и проверка знаний готовы!")
+                        st.markdown(result_text)
                 
     # Если текст получен (из аудио или YouTube), отправляем в Gemini
     if raw_transcript:
