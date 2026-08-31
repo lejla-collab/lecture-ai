@@ -77,28 +77,29 @@ def extract_youtube_id(url: str) -> str:
         return parsed.path.lstrip('/')
     return None
 
-def get_youtube_text(url: str):
-    video_id = extract_youtube_id(url)
-    if not video_id:
-        return None, "Некорректная ссылка на YouTube. Проверьте адрес."
-    
+def process_youtube_with_gemini(youtube_url: str):
+    """Отправляет ссылку YouTube напрямую в Gemini для анализа"""
     try:
-        # Получаем список всех доступных языков для этого видео
-        transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+        # Используем существующий ключ Gemini из настроек
+        client = genai.Client(api_key=GEMINI_API_KEY)
         
-        # Пробуем найти ручные или автоматические субтитры (ru, kk, en)
-        try:
-            transcript = transcript_list.find_transcript(['ru', 'kk', 'en'])
-        except:
-            # Если языки не совпали, берем самые первые доступные субтитры
-            transcript = transcript_list.find_generated_transcript(['ru', 'kk', 'en'])
-            
-        data = transcript.fetch()
-        full_text = " ".join([item['text'] for item in data])
-        return full_text, None
+        prompt = f"""
+        Посмотри это видео на YouTube: {youtube_url}
         
+        Сделай по нему:
+        1. Подробный конспект из 3 блоков (Главные мысли, Ключевые понятия и даты, Подробный разбор лекции).
+        2. Интерактивную проверку знаний (квиз из 5 вопросов с 4 вариантами ответов и указанием правильного ответа).
+        """
+        
+        # Вызываем модель, умеющую работать с видеоссылками
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt
+        )
+        
+        return response.text, None
     except Exception as e:
-        return None, f"Не удалось получить субтитры: у этого видео они отключены или заблокированы автором."
+        return None, f"Не удалось обработать видео: {str(e)}"
         
 class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
@@ -488,17 +489,17 @@ def main():
                 if os.path.exists(temp_audio_path):
                     os.remove(temp_audio_path)
 
-    else:
-        youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по Истории Казахстана):")
-        if youtube_url and st.button("🚀 Начать обработку YouTube видео", type="primary"):
-            with st.spinner("📹 Извлекаем субтитры из видео YouTube..."):
-                text, error = get_youtube_text(youtube_url)
-                if error:
-                    st.error(f"❌ {error}")
-                else:
-                    raw_transcript = text
-                    st.success("✅ Субтитры видео успешно извлечены!")
-
+else:
+    youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по истории):")
+    if youtube_url and st.button("Начать обработку YouTube видео"):
+        with st.spinner("Gemini изучаeт видео... Это займет 10–15 секунд"):
+            result_text, error = process_youtube_with_gemini(youtube_url)
+            if error:
+                st.error(error)
+            else:
+                st.success("Конспект и проверка знаний готовы!")
+                st.markdown(result_text)
+                
     # Если текст получен (из аудио или YouTube), отправляем в Gemini
     if raw_transcript:
         processor = LectureProcessor()
