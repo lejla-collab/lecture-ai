@@ -2,3 +2,4 @@ streamlit
 google-genai
 groq
 python-docx
+youtube-transcript-api
