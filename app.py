@@ -9,6 +9,7 @@ import docx
 import streamlit as st
 from google import genai
 from groq import Groq
+from youtube_transcript_api import YouTubeTranscriptApi
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -25,12 +26,8 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Скрывает ТОЛЬКО кнопку Deploy (Развертывание) */
-    [data-testid="stAppDeployButton"] {
-        display: none !important;
-    }
-    /* Скрывает кнопку в старых версиях Streamlit */
-    .stDeployButton {
+    /* Скрывает кнопку Deploy */
+    [data-testid="stAppDeployButton"], .stDeployButton {
         display: none !important;
     }
     </style>
@@ -38,6 +35,7 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# Инициализация состояний Session State
 if "quiz_block1" not in st.session_state:
     st.session_state.quiz_block1 = []
 if "quiz_block2" not in st.session_state:
@@ -64,6 +62,29 @@ if "show_explanation" not in st.session_state:
     st.session_state.show_explanation = False
 if "is_correct" not in st.session_state:
     st.session_state.is_correct = None
+
+
+def extract_youtube_id(url: str) -> str:
+    """Извлекает ID видео из любой ссылки YouTube"""
+    pattern = r'(?:v=|\/([0-9A-Za-z_-]{11}).*|youtu\.be\/)([0-9A-Za-z_-]{11})'
+    match = re.search(pattern, url)
+    if match:
+        return match.group(1) or match.group(2)
+    return None
+
+
+def get_youtube_text(url: str):
+    """Извлекает субтитры из видео на YouTube"""
+    video_id = extract_youtube_id(url)
+    if not video_id:
+        return None, "Некорректная ссылка на YouTube. Проверьте адрес."
+    try:
+        transcript = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
+        full_text = " ".join([item['text'] for item in transcript])
+        return full_text, None
+    except Exception:
+        return None, "Не удалось получить субтитры. Убедитесь, что у видео включены автосубтитры на YouTube."
+
 
 class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
@@ -190,6 +211,7 @@ class LectureProcessor:
 
         return summary_md, quiz_json
 
+
 def create_docx_bytes(markdown_text: str) -> bytes:
     doc = docx.Document()
     lines = markdown_text.split("\n")
@@ -213,6 +235,7 @@ def create_docx_bytes(markdown_text: str) -> bytes:
     buffer.seek(0)
     return buffer.getvalue()
 
+
 def render_duolingo_game():
     st.subheader("🎮 Проверка знаний")
 
@@ -226,7 +249,7 @@ def render_duolingo_game():
 
     curr_block = st.session_state.current_block
 
-    # --- ЭКРАН ФИНАЛА ---
+    # ЭКРАН ФИНАЛА
     if curr_block > 3:
         st.balloons()
         max_score = len(b1) + len(b2) + len(b3)
@@ -256,7 +279,7 @@ def render_duolingo_game():
             st.rerun()
         return
 
-    # --- БЛОК 1: ТЕСТ С ВЫБОРОМ ОТВЕТА ---
+    # БЛОК 1: ТЕСТ С ВЫБОРОМ ОТВЕТА
     if curr_block == 1:
         st.info("📌 **Блок 1 из 3: Викторина (выбор ответа)**")
         idx = st.session_state.b1_idx
@@ -304,7 +327,7 @@ def render_duolingo_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # --- БЛОК 2: НАЙТИ ПАРУ ---
+    # БЛОК 2: НАЙТИ ПАРУ
     elif curr_block == 2:
         st.info("📌 **Блок 2 из 3: Сопоставление (Найти пару)**")
         st.write("Сопоставьте термины слева с их правильными определениями:")
@@ -315,7 +338,6 @@ def render_duolingo_game():
         definitions = [item["definition"] for item in b2]
 
         if not st.session_state.b2_checked:
-            # Форма выбора вариантов
             for i, item in enumerate(b2):
                 term = item["term"]
                 st.session_state.b2_answers[term] = st.selectbox(
@@ -352,7 +374,7 @@ def render_duolingo_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # --- БЛОК 3: ВЕРНО / НЕВЕРНО ---
+    # БЛОК 3: ВЕРНО / НЕВЕРНО
     elif curr_block == 3:
         st.info("📌 **Блок 3 из 3: Правда или Ложь (True / False)**")
         idx = st.session_state.b3_idx
@@ -401,9 +423,10 @@ def render_duolingo_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
+
 def main():
     st.title("🎓 Lecture AI — Конспект & Проверка знаний")
-    st.caption("Расшифровка лекций, полные конспекты, экспорт в Word и трехэтапная интерактивная игра.")
+    st.caption("Обработка аудиофайлов и YouTube-видео, расшифровка, полные конспекты, экспорт в Word и трехэтапная интерактивная игра.")
 
     with st.sidebar:
         st.header("⚙️ Настройки")
@@ -418,25 +441,54 @@ def main():
             }[x],
         )
 
-    uploaded_file = st.file_uploader(
-        "Загрузите аудиозапись лекции (MP3, WAV, M4A, OGG)",
-        type=["mp3", "wav", "m4a", "ogg"],
+    # Выбор источника лекции
+    source_type = st.radio(
+        "Выберите способ загрузки лекции:",
+        ("Загрузить аудиофайл", "Ссылка на YouTube"),
+        horizontal=True
     )
 
-    if uploaded_file and st.button("🚀 Начать обработку лекции", type="primary"):
+    raw_transcript = None
+
+    if source_type == "Загрузить аудиофайл":
+        uploaded_file = st.file_uploader(
+            "Загрузите аудиозапись лекции (MP3, WAV, M4A, OGG)",
+            type=["mp3", "wav", "m4a", "ogg"],
+        )
+
+        if uploaded_file and st.button("🚀 Начать обработку лекции", type="primary"):
+            processor = LectureProcessor()
+            with tempfile.NamedTemporaryFile(
+                delete=False, suffix=os.path.splitext(uploaded_file.name)[1]
+            ) as tmp_file:
+                tmp_file.write(uploaded_file.getbuffer())
+                temp_audio_path = tmp_file.name
+
+            try:
+                with st.spinner("🎧 Шаг 1/2: Расшифровка аудиозаписи (Groq Whisper)..."):
+                    raw_transcript = processor.transcribe_audio(temp_audio_path)
+                st.success("✅ Транскрибация завершена!")
+            except Exception as e:
+                st.error(f"❌ Ошибка при обработке аудио: {str(e)}")
+            finally:
+                if os.path.exists(temp_audio_path):
+                    os.remove(temp_audio_path)
+
+    else:
+        youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по Истории Казахстана):")
+        if youtube_url and st.button("🚀 Начать обработку YouTube видео", type="primary"):
+            with st.spinner("📹 Извлекаем субтитры из видео YouTube..."):
+                text, error = get_youtube_text(youtube_url)
+                if error:
+                    st.error(f"❌ {error}")
+                else:
+                    raw_transcript = text
+                    st.success("✅ Субтитры видео успешно извлечены!")
+
+    # Если текст получен (из аудио или YouTube), отправляем в Gemini
+    if raw_transcript:
         processor = LectureProcessor()
-
-        with tempfile.NamedTemporaryFile(
-            delete=False, suffix=os.path.splitext(uploaded_file.name)[1]
-        ) as tmp_file:
-            tmp_file.write(uploaded_file.getbuffer())
-            temp_audio_path = tmp_file.name
-
         try:
-            with st.spinner("🎧 Шаг 1/2: Расшифровка аудиозаписи (Groq Whisper)..."):
-                raw_transcript = processor.transcribe_audio(temp_audio_path)
-            st.success("✅ Транскрибация завершена!")
-
             with st.spinner("🤖 Шаг 2/2: Gemini формирует конспект и 3 блока заданий..."):
                 summary_md, quiz_json = processor.generate_content_and_quiz(
                     text=raw_transcript, target_lang=selected_lang
@@ -457,11 +509,7 @@ def main():
                 st.session_state.show_explanation = False
 
         except Exception as e:
-            st.error(f"❌ Произошла ошибка при обработке: {str(e)}")
-
-        finally:
-            if os.path.exists(temp_audio_path):
-                os.remove(temp_audio_path)
+            st.error(f"❌ Ошибка при генерации конспекта: {str(e)}")
 
     # Отображение результатов
     if "summary_md" in st.session_state:
