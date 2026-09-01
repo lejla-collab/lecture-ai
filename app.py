@@ -13,6 +13,7 @@ from google import genai
 from groq import Groq
 from youtube_transcript_api import YouTubeTranscriptApi
 import subprocess
+import yt_dlp
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -77,10 +78,10 @@ def extract_youtube_id(url: str) -> str:
     return None
 
 def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor) -> str:
-    """Пробует забрать субтитры. Если их нет — скачивает аудио и транскрибирует через Groq."""
+    """Пробует забрать субтитры. Если их нет — скачивает аудио в MP3/M4A и транскрибирует через Groq."""
     video_id = extract_youtube_id(video_url)
     
-    # Попытка 1: Загрузка субтитров
+    # Попытка 1: Загрузка субтитров через API
     if video_id:
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
@@ -91,26 +92,29 @@ def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor)
                 transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
                 return " ".join([item['text'] for item in transcript.fetch()])
             except Exception:
-                pass  # Субтитров нет, переходим к скачиванию аудио
+                pass  # Субтитров нет, переходим к скачиванию звука
 
-    # Попытка 2: Скачивание аудио через yt-dlp + Groq Whisper
+    # Попытка 2: Безопасное извлечение аудиопотока через yt-dlp в Python
     with tempfile.TemporaryDirectory() as tmp_dir:
-        out_path = os.path.join(tmp_dir, "yt_audio.mp3")
-        # Скачиваем аудио с низкой битрейт-нагрузкой для быстроты
-        cmd = [
-            "yt-dlp",
-            "-x",
-            "--audio-format", "mp3",
-            "--audio-quality", "5",
-            "-o", out_path,
-            video_url
-        ]
-        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
         
-        if result.returncode != 0 or not os.path.exists(out_path):
-            raise Exception("Не удалось извлечь аудио из видео. Проверьте доступность видео.")
+        ydl_opts = {
+            'format': 'm4a/bestaudio/best',
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=True)
+            downloaded_file = ydl.prepare_filename(info)
 
-        return processor.transcribe_audio(out_path)       
+        if not os.path.exists(downloaded_file):
+            raise Exception("Не удалось сохранить аудиофайл. Проверьте права доступа и доступность видео.")
+
+        # Отправляем скачанный аудиофайл в Whisper Groq
+        return processor.transcribe_audio(downloaded_file)    
 
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
