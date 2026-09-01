@@ -79,14 +79,11 @@ def extract_youtube_id(url: str) -> str:
         return parsed.path.lstrip("/")
     return None
 
-from pytubefix import YouTube
-from pytubefix.cli import on_progress
-
 def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor) -> str:
-    """Пробует забрать субтитры. Если их нет — скачивает аудио через pytubefix и отправляет в Groq."""
+    """Извлекает субтитры через API или скачивает аудио через yt-dlp с обходом PoToken."""
     video_id = extract_youtube_id(video_url)
     
-    # Попытка 1: Загрузка субтитров через API
+    # Попытка 1: Извлечение субтитров через официальные/автоматические субтитры YouTube
     if video_id:
         try:
             transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
@@ -97,25 +94,43 @@ def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor)
                 transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
                 return " ".join([item['text'] for item in transcript.fetch()])
             except Exception:
-                pass  # Если субтитров нет, скачиваем аудио
+                pass  # Субтитров нет, переходим к скачиванию аудио
 
-    # Попытка 2: Скачивание аудиопотока через pytubefix (клиент WEB/ANDROID обходит 403)
-    try:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            yt = YouTube(video_url, client='WEB')
-            # Выбираем только аудиодорожку с минимальным размером
-            audio_stream = yt.streams.filter(only_audio=True).first()
-            if not audio_stream:
-                raise Exception("Аудиодорожка не найдена в видео.")
-            
-            # Скачиваем файл в временную папку
-            out_file = audio_stream.download(output_path=tmp_dir, filename="yt_audio.m4a")
-            
-            # Транскрибируем через Whisper (Groq)
-            return processor.transcribe_audio(out_file)
-            
-    except Exception as e:
-        raise Exception(f"Не удалось извлечь аудио из видео: {str(e)}")
+    # Попытка 2: Скачивание аудио через yt-dlp с эмуляцией клиентом Android VR (обход PoToken)
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
+        
+        ydl_opts = {
+            'format': 'm4a/bestaudio/best',
+            'outtmpl': out_tmpl,
+            'quiet': True,
+            'no_warnings': True,
+            'nocheckcertificate': True,
+            # Ключевой параметр для обхода PoToken и ошибки SABR:
+            'extractor_args': {
+                'youtube': {
+                    'player_client': ['android_vr', 'web'],
+                    'player_skip': ['webpage', 'configs'],
+                }
+            },
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/114.0 Firefox/114.0',
+            }
+        }
+        
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(video_url, download=True)
+                downloaded_file = ydl.prepare_filename(info)
+
+            if not os.path.exists(downloaded_file):
+                raise Exception("Файл не был сохранен.")
+
+            # Отправляем аудио на распознавание в Groq Whisper
+            return processor.transcribe_audio(downloaded_file)
+
+        except Exception as e:
+            raise Exception(f"Не удалось извлечь контент из видео. Убедитесь, что у видео есть субтитры или запустите обработку через аудиофайл. Ошибка: {str(e)}")
         
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
