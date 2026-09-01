@@ -3,13 +3,14 @@ import json
 import os
 import re
 import tempfile
+import time
 from typing import Dict, List
+from urllib.parse import parse_qs, urlparse
 
 import docx
 import streamlit as st
 from google import genai
 from groq import Groq
-from youtube_transcript_api import YouTubeTranscriptApi
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -17,7 +18,7 @@ GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 MAX_FILE_SIZE_BYTES = 18 * 1024 * 1024
 
 st.set_page_config(
-    page_title="Lecture AI — Конспект & Duolingo Quiz",
+    page_title="Lecture AI — Конспект & Проверка знаний",
     page_icon="🎓",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -47,13 +48,10 @@ if "current_block" not in st.session_state:
     st.session_state.current_block = 1
 if "b1_idx" not in st.session_state:
     st.session_state.b1_idx = 0
+if "b2_idx" not in st.session_state:
+    st.session_state.b2_idx = 0
 if "b3_idx" not in st.session_state:
     st.session_state.b3_idx = 0
-
-if "b2_checked" not in st.session_state:
-    st.session_state.b2_checked = False
-if "b2_score" not in st.session_state:
-    st.session_state.b2_score = 0
 
 if "total_score" not in st.session_state:
     st.session_state.total_score = 0
@@ -63,49 +61,39 @@ if "show_explanation" not in st.session_state:
 if "is_correct" not in st.session_state:
     st.session_state.is_correct = None
 
-from urllib.parse import urlparse, parse_qs
 
 def extract_youtube_id(url: str) -> str:
-    """Надежно извлекает ID видео из любых ссылок YouTube"""
+    """Извлекает ID видео из любых ссылок YouTube"""
     parsed = urlparse(url)
-    if parsed.hostname in ('www.youtube.com', 'youtube.com'):
-        if parsed.path == '/watch':
-            return parse_qs(parsed.query).get('v', [None])[0]
-        if parsed.path.startswith(('/embed/', '/v/')):
-            return parsed.path.split('/')[2]
-    elif parsed.hostname == 'youtu.be':
-        return parsed.path.lstrip('/')
+    if parsed.hostname in ("www.youtube.com", "youtube.com"):
+        if parsed.path == "/watch":
+            return parse_qs(parsed.query).get("v", [None])[0]
+        if parsed.path.startswith(("/embed/", "/v/")):
+            return parsed.path.split("/")[2]
+    elif parsed.hostname == "youtu.be":
+        return parsed.path.lstrip("/")
     return None
 
-def process_youtube_with_gemini(youtube_url: str):
-    """Отправляет ссылку YouTube напрямую в Gemini для анализа"""
-    try:
-        # Используем существующий ключ Gemini из настроек
-        client = genai.Client(api_key=GEMINI_API_KEY)
-        
-        prompt = f"""
-        Посмотри это видео на YouTube: {youtube_url}
-        
-        Сделай по нему:
-        1. Подробный конспект из 3 блоков (Главные мысли, Ключевые понятия и даты, Подробный разбор лекции).
-        2. Интерактивную проверку знаний (квиз из 5 вопросов с 4 вариантами ответов и указанием правильного ответа).
-        """
-        
-        # Вызываем модель, умеющую работать с видеоссылками
-        response = client.models.generate_content(
-            model='gemini-3.6-flash',
-            contents=prompt
-        )
-        
-        return response.text, None
-    except Exception as e:
-        return None, f"Не удалось обработать видео: {str(e)}"
-        
+
+def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
+    """Безопасный вызов Gemini API с повторными попытками при 503 ошибке"""
+    for i in range(retries):
+        try:
+            response = client.models.generate_content(model=model, contents=prompt)
+            return response.text
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                if i < retries - 1:
+                    time.sleep(delay * (i + 1))
+                    continue
+            raise e
+
+
 class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-3.6-flash"
+        self.gemini_model = "gemini-2.5-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
@@ -151,7 +139,7 @@ class LectureProcessor:
         progress_bar.empty()
         return "\n".join(full_transcript)
 
-    def generate_content_and_quiz(self, text: str, target_lang: str):
+    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
         lang_instructions: Dict[str, str] = {
             "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
             "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
@@ -160,57 +148,64 @@ class LectureProcessor:
         }
         instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
 
+        source_prompt = f"Посмотри и проанализируй это видео на YouTube: {text_or_url}" if is_youtube else f"Текст лекции для анализа:\n{text_or_url}"
+
         prompt = f"""
-Ты — профессиональный академический методист и разработчик обучающих игр.
-Проанализируй текст лекции ниже и сгенерируй:
-1. Подробнейший объёмный конспект со всеми деталями, фактами, примерами и таблицами.
-2. Игровые задания из 3 БЛОКОВ в формате JSON.
+Ты — высококлассный преподаватель и методист.
+{source_prompt}
+
+Твоя задача — составить наглядно структурированный, разложенный "по полочкам" конспект и проверку знаний из 3 блоков.
 
 ЯЗЫКОВОЕ ТРЕБОВАНИЕ:
 {instruction}
 
-ТРЕБОВАНИЯ К 3 БЛОКАМ ИГРЫ:
-- БЛОК 1 (multiple_choice): 10 вопросов с 4 вариантами ответов (A, B, C, D).
-- БЛОК 2 (match_pairs): 4-5 пар "термин - короткое определение" для задания "Найти пару".
-- БЛОК 3 (true_false): 5 вопросов формата "Верно или Неверно" (True / False).
+ТРЕБОВАНИЯ К КОНСПЕКТУ:
+1. Максимально подробный и понятный для студента.
+2. Используй таблицы сравнений, структурированные списки, выдели ключевые даты, термины и примеры из практики.
+3. Оформи схематичный кластер (логическую связь основных тем лекции).
+
+ТРЕБОВАНИЯ К 3 БЛОКАМ ПРОВЕРКИ ЗНАНИЙ (JSON):
+- БЛОК 1: 10 подробных вопросов с 4 вариантами ответов (A, B, C, D) для ключевой проверки.
+- БЛОК 2: Квиз из 4-5 вопросов с 4 вариантами ответов (A, B, C, D) и детальным объяснением.
+- БЛОК 3: 5 вопросов формата "Верно или Неверно" (True / False).
 
 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА:
 Сначала напиши подробный конспект в формате Markdown.
-В самом конце напиши JSON строго в следующем виде:
+В самом конце напиши JSON строго в следующем формате:
 
 ===QUIZ_JSON_START===
 {{
   "block1": [
     {{
-      "question": "Текст вопроса?",
+      "question": "Текст вопроса 1?",
       "options": ["Вариант A", "Вариант B", "Вариант C", "Вариант D"],
       "correct_index": 0,
-      "explanation": "Подробное объяснение правильного ответа."
+      "explanation": "Подробное пояснение ответов."
     }}
   ],
   "block2": [
-    {{"term": "Термин 1", "definition": "Короткое определение 1"}},
-    {{"term": "Термин 2", "definition": "Короткое определение 2"}},
-    {{"term": "Термин 3", "definition": "Короткое определение 3"}},
-    {{"term": "Термин 4", "definition": "Короткое определение 4"}}
+    {{
+      "question": "Вопрос квиза 1?",
+      "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"],
+      "correct_index": 1,
+      "explanation": "Пояснение квиза."
+    }}
   ],
   "block3": [
     {{
-      "statement": "Утверждение по теме лекции",
+      "statement": "Утверждение для проверки",
       "is_true": true,
       "explanation": "Почему это правда или ложь."
     }}
   ]
 }}
 ===QUIZ_JSON_END===
-
-Текст лекции:
-{text}
 """
-        response = self.gemini_client.models.generate_content(
-            model=self.gemini_model, contents=prompt
+        raw_text = call_gemini_with_retry(
+            client=self.gemini_client,
+            model=self.gemini_model,
+            prompt=prompt
         )
-        raw_text = response.text
 
         summary_md = raw_text
         quiz_json = {"block1": [], "block2": [], "block3": []}
@@ -251,8 +246,8 @@ def create_docx_bytes(markdown_text: str) -> bytes:
     return buffer.getvalue()
 
 
-def render_duolingo_game():
-    st.subheader("🎮 Проверка знаний")
+def render_quiz_game():
+    st.subheader("🎯 Проверка знаний")
 
     b1 = st.session_state.quiz_block1
     b2 = st.session_state.quiz_block2
@@ -283,25 +278,24 @@ def render_duolingo_game():
         else:
             st.error("📚 Рекомендуем повторно перечитать конспект лекции.")
 
-        if st.button("🔄 Пройти игру заново", type="primary"):
+        if st.button("🔄 Пройти проверку знаний заново", type="primary"):
             st.session_state.current_block = 1
             st.session_state.b1_idx = 0
+            st.session_state.b2_idx = 0
             st.session_state.b3_idx = 0
-            st.session_state.b2_checked = False
-            st.session_state.b2_score = 0
             st.session_state.total_score = 0
             st.session_state.show_explanation = False
             st.rerun()
         return
 
-    # БЛОК 1: ТЕСТ С ВЫБОРОМ ОТВЕТА
+    # БЛОК 1: ОСНОВНОЙ ТЕСТ (10 ВОПРОСОВ)
     if curr_block == 1:
-        st.info("📌 **Блок 1 из 3: Викторина (выбор ответа)**")
+        st.info("📌 **Блок 1 из 3: Вопросы по материалу (10 вопросов)**")
         idx = st.session_state.b1_idx
         total_q = len(b1)
 
         if idx >= total_q:
-            st.success("🎉 Блок 1 завершен! Переходим к Блоку 2 ('Найти пару')...")
+            st.success("🎉 Блок 1 завершен! Переходим к Блоку 2 (Квиз)...")
             if st.button("Перейти к Блоку 2 ➡️", type="primary"):
                 st.session_state.current_block = 2
                 st.session_state.show_explanation = False
@@ -314,14 +308,14 @@ def render_duolingo_game():
 
         st.markdown(f"#### ❓ {item['question']}")
         selected = st.radio(
-            "Выберите вариант:",
+            "Выберите вариант ответа:",
             options=item["options"],
             key=f"b1_q_{idx}",
             disabled=st.session_state.show_explanation,
         )
 
         if not st.session_state.show_explanation:
-            if st.button("✅ Ответить", type="primary"):
+            if st.button("✅ Ответить", type="primary", key=f"b1_btn_{idx}"):
                 selected_idx = item["options"].index(selected)
                 is_correct = selected_idx == item["correct_index"]
                 st.session_state.is_correct = is_correct
@@ -337,67 +331,68 @@ def render_duolingo_game():
                 st.error(f"❌ **Неверно.** Правильный ответ: **{correct_text}**")
             st.info(f"💡 **Пояснение:** {item['explanation']}")
 
-            if st.button("Следующий вопрос ➡️", type="primary"):
+            if st.button("Следующий вопрос ➡️", type="primary", key=f"b1_next_{idx}"):
                 st.session_state.b1_idx += 1
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # БЛОК 2: НАЙТИ ПАРУ
+    # БЛОК 2: КВИЗ (4-5 ВОПРОСОВ)
     elif curr_block == 2:
-        st.info("📌 **Блок 2 из 3: Сопоставление (Найти пару)**")
-        st.write("Сопоставьте термины слева с их правильными определениями:")
+        st.info("📌 **Блок 2 из 3: Быстрый Квиз**")
+        idx = st.session_state.b2_idx
+        total_q = len(b2)
 
-        if "b2_answers" not in st.session_state:
-            st.session_state.b2_answers = {}
-
-        definitions = [item["definition"] for item in b2]
-
-        if not st.session_state.b2_checked:
-            for i, item in enumerate(b2):
-                term = item["term"]
-                st.session_state.b2_answers[term] = st.selectbox(
-                    f"**Термин:** {term}",
-                    options=["-- Выберите определение --"] + definitions,
-                    key=f"b2_select_{i}",
-                )
-
-            if st.button("✅ Проверить ответы", type="primary"):
-                score = 0
-                for item in b2:
-                    if st.session_state.b2_answers.get(item["term"]) == item["definition"]:
-                        score += 1
-                st.session_state.b2_score = score
-                st.session_state.total_score += score
-                st.session_state.b2_checked = True
-                st.rerun()
-
-        else:
-            for item in b2:
-                term = item["term"]
-                user_def = st.session_state.b2_answers.get(term)
-                correct_def = item["definition"]
-
-                if user_def == correct_def:
-                    st.success(f"✅ **{term}** ➔ {user_def}")
-                else:
-                    st.error(f"❌ **{term}**\n- Твой ответ: *{user_def}*\n- Правильно: **{correct_def}**")
-
-            st.markdown(f"**Результат блока 2:** Совпало {st.session_state.b2_score} из {len(b2)} пар!")
-
+        if idx >= total_q:
+            st.success("🎉 Блок 2 завершен! Переходим к Блоку 3 (Верно / Неверно)...")
             if st.button("Перейти к Блоку 3 ➡️", type="primary"):
                 st.session_state.current_block = 3
+                st.session_state.show_explanation = False
+                st.rerun()
+            return
+
+        item = b2[idx]
+        st.progress((idx) / total_q)
+        st.caption(f"Вопрос {idx + 1} из {total_q} | Очки: {st.session_state.total_score}")
+
+        st.markdown(f"#### ⚡ {item['question']}")
+        selected = st.radio(
+            "Ваш ответ:",
+            options=item["options"],
+            key=f"b2_q_{idx}",
+            disabled=st.session_state.show_explanation,
+        )
+
+        if not st.session_state.show_explanation:
+            if st.button("✅ Ответить", type="primary", key=f"b2_btn_{idx}"):
+                selected_idx = item["options"].index(selected)
+                is_correct = selected_idx == item["correct_index"]
+                st.session_state.is_correct = is_correct
+                st.session_state.show_explanation = True
+                if is_correct:
+                    st.session_state.total_score += 1
+                st.rerun()
+        else:
+            if st.session_state.is_correct:
+                st.success("🎉 **Отлично!**")
+            else:
+                correct_text = item["options"][item["correct_index"]]
+                st.error(f"❌ **Ошибка.** Правильный вариант: **{correct_text}**")
+            st.info(f"💡 **Пояснение:** {item['explanation']}")
+
+            if st.button("Следующий вопрос ➡️", type="primary", key=f"b2_next_{idx}"):
+                st.session_state.b2_idx += 1
                 st.session_state.show_explanation = False
                 st.rerun()
 
     # БЛОК 3: ВЕРНО / НЕВЕРНО
     elif curr_block == 3:
-        st.info("📌 **Блок 3 из 3: Правда или Ложь (True / False)**")
+        st.info("📌 **Блок 3 из 3: Верно или Неверно (True / False)**")
         idx = st.session_state.b3_idx
         total_q = len(b3)
 
         if idx >= total_q:
-            st.success("🎉 Блок 3 завершен! Все задания пройдены!")
-            if st.button("Завершить игру и посмотреть результат 🏆", type="primary"):
+            st.success("🎉 Все блоки успешно пройдены!")
+            if st.button("Завершить и узнать результаты 🏆", type="primary"):
                 st.session_state.current_block = 4
                 st.rerun()
             return
@@ -409,7 +404,7 @@ def render_duolingo_game():
         st.markdown(f"#### 📢 {item['statement']}")
 
         user_choice = st.radio(
-            "Это утверждение верно?",
+            "Утверждение является истинным?",
             options=["Верно", "Неверно"],
             key=f"b3_radio_{idx}",
             disabled=st.session_state.show_explanation,
@@ -417,8 +412,8 @@ def render_duolingo_game():
 
         if not st.session_state.show_explanation:
             if st.button("✅ Ответить", type="primary", key=f"b3_ans_btn_{idx}"):
-                choice_bool = (user_choice == "Верно")
-                is_correct = (choice_bool == item["is_true"])
+                choice_bool = user_choice == "Верно"
+                is_correct = choice_bool == item["is_true"]
                 st.session_state.is_correct = is_correct
                 st.session_state.show_explanation = True
                 if is_correct:
@@ -426,10 +421,10 @@ def render_duolingo_game():
                 st.rerun()
         else:
             if st.session_state.is_correct:
-                st.success("🎉 **Совершенно верно!**")
+                st.success("🎉 **Правильно!**")
             else:
                 correct_ans_str = "Верно" if item["is_true"] else "Неверно"
-                st.error(f"❌ **Неверно.** Правильный ответ: **{correct_ans_str}**")
+                st.error(f"❌ **Неверно.** Правильно: **{correct_ans_str}**")
 
             st.info(f"💡 **Пояснение:** {item['explanation']}")
 
@@ -441,7 +436,7 @@ def render_duolingo_game():
 
 def main():
     st.title("🎓 Lecture AI — Конспект & Проверка знаний")
-    st.caption("Обработка аудиофайлов и YouTube-видео, расшифровка, полные конспекты, экспорт в Word и трехэтапная интерактивная игра.")
+    st.caption("Автоматическое создание наглядных конспектов и интерактивной проверки знаний по аудио и видео лекциям.")
 
     with st.sidebar:
         st.header("⚙️ Настройки")
@@ -460,11 +455,12 @@ def main():
     source_type = st.radio(
         "Выберите способ загрузки лекции:",
         ("Загрузить аудиофайл", "Ссылка на YouTube"),
-        horizontal=True
+        horizontal=True,
     )
 
-    raw_transcript = None
+    processor = LectureProcessor()
 
+    # Вариант 1: Загрузить аудиофайл
     if source_type == "Загрузить аудиофайл":
         uploaded_file = st.file_uploader(
             "Загрузите аудиозапись лекции (MP3, WAV, M4A, OGG)",
@@ -472,7 +468,6 @@ def main():
         )
 
         if uploaded_file and st.button("🚀 Начать обработку лекции", type="primary"):
-            processor = LectureProcessor()
             with tempfile.NamedTemporaryFile(
                 delete=False, suffix=os.path.splitext(uploaded_file.name)[1]
             ) as tmp_file:
@@ -480,60 +475,83 @@ def main():
                 temp_audio_path = tmp_file.name
 
             try:
-                with st.spinner("🎧 Шаг 1/2: Расшифровка аудиозаписи (Groq Whisper)..."):
+                with st.spinner("🎧 Расшифровка аудиозаписи (Groq Whisper)..."):
                     raw_transcript = processor.transcribe_audio(temp_audio_path)
                 st.success("✅ Транскрибация завершена!")
+
+                with st.spinner("🤖 Gemini формирует структурированный конспект и 3 блока заданий..."):
+                    summary_md, quiz_json = processor.generate_content_and_quiz(
+                        text_or_url=raw_transcript, target_lang=selected_lang, is_youtube=False
+                    )
+
+                st.session_state.summary_md = summary_md
+                st.session_state.quiz_block1 = quiz_json.get("block1", [])
+                st.session_state.quiz_block2 = quiz_json.get("block2", [])
+                st.session_state.quiz_block3 = quiz_json.get("block3", [])
+                st.session_state.raw_transcript = raw_transcript
+                st.session_state.current_youtube_url = None
+
+                # Сброс состояния игры
+                st.session_state.current_block = 1
+                st.session_state.b1_idx = 0
+                st.session_state.b2_idx = 0
+                st.session_state.b3_idx = 0
+                st.session_state.total_score = 0
+                st.session_state.show_explanation = False
+
             except Exception as e:
                 st.error(f"❌ Ошибка при обработке аудио: {str(e)}")
             finally:
                 if os.path.exists(temp_audio_path):
                     os.remove(temp_audio_path)
 
-        else:
-            youtube_url = st.text_input("Вставьте ссылку на видео с YouTube (например, урок по истории):")
-            if youtube_url and st.button("Начать обработку YouTube видео"):
-                with st.spinner("Gemini изучаeт видео... Это займет 10–15 секунд"):
-                    result_text, error = process_youtube_with_gemini(youtube_url)
-                    if error:
-                        st.error(error)
-                    else:
-                        st.success("Конспект и проверка знаний готовы!")
-                        st.markdown(result_text)
-                
-    # Если текст получен (из аудио или YouTube), отправляем в Gemini
-    if raw_transcript:
-        processor = LectureProcessor()
-        try:
-            with st.spinner("🤖 Шаг 2/2: Gemini формирует конспект и 3 блока заданий..."):
-                summary_md, quiz_json = processor.generate_content_and_quiz(
-                    text=raw_transcript, target_lang=selected_lang
-                )
+    # Вариант 2: Ссылка на YouTube
+    else:
+        youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
+        
+        # Показываем видеоплеер для подтверждения найденного видео
+        if youtube_url.strip():
+            video_id = extract_youtube_id(youtube_url)
+            if video_id:
+                st.video(youtube_url)
+            else:
+                st.warning("Пожалуйста, введите корректную ссылку на YouTube видео.")
+
+        if youtube_url.strip() and st.button("🚀 Начать обработку YouTube видео", type="primary"):
+            try:
+                with st.spinner("🤖 Gemini изучает видео... Это займет 10–15 секунд"):
+                    summary_md, quiz_json = processor.generate_content_and_quiz(
+                        text_or_url=youtube_url, target_lang=selected_lang, is_youtube=True
+                    )
+
                 st.session_state.summary_md = summary_md
                 st.session_state.quiz_block1 = quiz_json.get("block1", [])
                 st.session_state.quiz_block2 = quiz_json.get("block2", [])
                 st.session_state.quiz_block3 = quiz_json.get("block3", [])
-                st.session_state.raw_transcript = raw_transcript
+                st.session_state.raw_transcript = "Анализ произведен напрямую из видео YouTube."
+                st.session_state.current_youtube_url = youtube_url
 
                 # Сброс состояния игры
                 st.session_state.current_block = 1
                 st.session_state.b1_idx = 0
+                st.session_state.b2_idx = 0
                 st.session_state.b3_idx = 0
-                st.session_state.b2_checked = False
-                st.session_state.b2_score = 0
                 st.session_state.total_score = 0
                 st.session_state.show_explanation = False
 
-        except Exception as e:
-            st.error(f"❌ Ошибка при генерации конспекта: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Ошибка при обработке видео: {str(e)}")
 
     # Отображение результатов
     if "summary_md" in st.session_state:
         st.markdown("---")
         tab_summary, tab_game, tab_transcript = st.tabs(
-            ["📄 Подробный конспект", "🎮 Проверка знаний", "📜 Исходный транскрипт"]
+            ["📄 Подробный конспект", "🎯 Проверка знаний", "📜 Исходный транскрипт"]
         )
 
         with tab_summary:
+            if st.session_state.get("current_youtube_url"):
+                st.video(st.session_state.current_youtube_url)
             st.markdown(st.session_state.summary_md)
             st.markdown("---")
             docx_file = create_docx_bytes(st.session_state.summary_md)
@@ -545,7 +563,7 @@ def main():
             )
 
         with tab_game:
-            render_duolingo_game()
+            render_quiz_game()
 
         with tab_transcript:
             st.text_area("Распознанный исходный текст:", value=st.session_state.raw_transcript, height=350)
