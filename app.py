@@ -11,6 +11,7 @@ import docx
 import streamlit as st
 from google import genai
 from groq import Groq
+from youtube_transcript_api import YouTubeTranscriptApi
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -74,6 +75,21 @@ def extract_youtube_id(url: str) -> str:
         return parsed.path.lstrip("/")
     return None
 
+def get_youtube_transcript(video_id: str) -> str:
+    """Извлекает субтитры из YouTube видео"""
+    try:
+        # Пробуем получить субтитры на русском, казахском или английском
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
+        return " ".join([item['text'] for item in transcript_list])
+    except Exception:
+        # Если указанных языков нет, берем любые доступные субтитры
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
+            return " ".join([item['text'] for item in transcript.fetch()])
+        except Exception as e:
+            raise Exception("Не удалось загрузить субтитры. Убедитесь, что у видео включены субтитры на YouTube.")
+            
 
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
@@ -506,43 +522,45 @@ def main():
                 if os.path.exists(temp_audio_path):
                     os.remove(temp_audio_path)
 
-    # Вариант 2: Ссылка на YouTube
+# Вариант 2: Ссылка на YouTube
     else:
         youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
-        
-        # Показываем видеоплеер для подтверждения найденного видео
-        if youtube_url.strip():
-            video_id = extract_youtube_id(youtube_url)
-            if video_id:
-                st.video(youtube_url)
-            else:
-                st.warning("Пожалуйста, введите корректную ссылку на YouTube видео.")
 
         if youtube_url.strip() and st.button("🚀 Начать обработку YouTube видео", type="primary"):
-            try:
-                with st.spinner("🤖 Gemini изучает видео... Это займет 10–15 секунд"):
-                    summary_md, quiz_json = processor.generate_content_and_quiz(
-                        text_or_url=youtube_url, target_lang=selected_lang, is_youtube=True
-                    )
+            video_id = extract_youtube_id(youtube_url)
+            
+            if not video_id:
+                st.error("❌ Некорректная ссылка на YouTube видео.")
+            else:
+                try:
+                    # 1. Извлекаем субтитры
+                    with st.spinner("📜 Получение субтитров из видео..."):
+                        transcript_text = get_youtube_transcript(video_id)
 
-                st.session_state.summary_md = summary_md
-                st.session_state.quiz_block1 = quiz_json.get("block1", [])
-                st.session_state.quiz_block2 = quiz_json.get("block2", [])
-                st.session_state.quiz_block3 = quiz_json.get("block3", [])
-                st.session_state.raw_transcript = "Анализ произведен напрямую из видео YouTube."
-                st.session_state.current_youtube_url = youtube_url
+                    # 2. Передаем РЕАЛЬНЫЙ текст субтитров в Gemini
+                    with st.spinner("🤖 Gemini анализирует текст и создает конспект и тесты..."):
+                        summary_md, quiz_json = processor.generate_content_and_quiz(
+                            text_or_url=transcript_text, target_lang=selected_lang, is_youtube=False
+                        )
 
-                # Сброс состояния игры
-                st.session_state.current_block = 1
-                st.session_state.b1_idx = 0
-                st.session_state.b2_idx = 0
-                st.session_state.b3_idx = 0
-                st.session_state.total_score = 0
-                st.session_state.show_explanation = False
+                    st.session_state.summary_md = summary_md
+                    st.session_state.quiz_block1 = quiz_json.get("block1", [])
+                    st.session_state.quiz_block2 = quiz_json.get("block2", [])
+                    st.session_state.quiz_block3 = quiz_json.get("block3", [])
+                    st.session_state.raw_transcript = transcript_text
+                    st.session_state.current_youtube_url = youtube_url
 
-            except Exception as e:
-                st.error(f"❌ Ошибка при обработке видео: {str(e)}")
+                    # Сброс состояния игры
+                    st.session_state.current_block = 1
+                    st.session_state.b1_idx = 0
+                    st.session_state.b2_idx = 0
+                    st.session_state.b3_idx = 0
+                    st.session_state.total_score = 0
+                    st.session_state.show_explanation = False
 
+                except Exception as e:
+                    st.error(f"❌ Ошибка при обработке видео: {str(e)}")
+                    
     # Отображение результатов
     if "summary_md" in st.session_state:
         st.markdown("---")
