@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import time
+import requests
 from typing import Dict, List
 from urllib.parse import parse_qs, urlparse
 
@@ -79,29 +80,33 @@ def extract_youtube_id(url: str) -> str:
     return None
 
 def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor) -> str:
-    """Извлекает субтитры через API. Если их нет, выдает понятную инструкцию пользователю."""
-    video_id = extract_youtube_id(video_url)
+    """Получает субтитры через надежный сторонний API Supadata"""
+    api_key = st.secrets.get("SUPADATA_API_KEY", "")
     
-    if not video_id:
-        raise Exception("Не удалось распознать ID видео. Проверьте ссылку.")
-
+    if not api_key:
+        raise Exception("Не найден SUPADATA_API_KEY в настройках st.secrets. Добавьте его в secrets.")
+    
+    # Запрос к API Supadata
+    url = f"https://api.supadata.ai/v1/youtube/transcript?url={video_url}"
+    headers = {"x-api-key": api_key}
+    
     try:
-        # Попытка 1: Ищем субтитры на нужных языках
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
-        return " ".join([item['text'] for item in transcript_list])
-    except Exception:
-        try:
-            # Попытка 2: Ищем любые доступные субтитры (включая автосгенерированные)
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
-            return " ".join([item['text'] for item in transcript.fetch()])
-        except Exception:
-            # Отдаем красивую ошибку вместо падения приложения
-            raise Exception(
-                "У этого видео нет встроенных субтитров, а YouTube блокирует прямое скачивание звука. "
-                "Пожалуйста, скачайте аудио из этого видео (например, через любой онлайн-конвертер YouTube to MP3) "
-                "и загрузите его через вкладку загрузки аудиофайла."
-            )
+        response = requests.get(url, headers=headers)
+        
+        if response.status_code != 200:
+            raise Exception(f"Ошибка сервиса: {response.text}")
+            
+        data = response.json()
+        content = data.get("content", [])
+        
+        if not content:
+            raise Exception("У этого видео нет доступных субтитров.")
+            
+        # Собираем весь текст субтитров в одну строку
+        return " ".join([item.get("text", "") for item in content])
+        
+    except Exception as e:
+        raise Exception(f"Не удалось получить субтитры через Supadata: {str(e)}")
             
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
