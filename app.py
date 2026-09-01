@@ -13,7 +13,6 @@ from google import genai
 from groq import Groq
 from youtube_transcript_api import YouTubeTranscriptApi
 import subprocess
-import yt_dlp
 from pytubefix import YouTube
 from pytubefix.cli import on_progress
 
@@ -80,58 +79,30 @@ def extract_youtube_id(url: str) -> str:
     return None
 
 def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor) -> str:
-    """Извлекает субтитры через API или скачивает аудио через yt-dlp с обходом PoToken."""
+    """Извлекает субтитры через API. Если их нет, выдает понятную инструкцию пользователю."""
     video_id = extract_youtube_id(video_url)
     
-    # Попытка 1: Извлечение субтитров через официальные/автоматические субтитры YouTube
-    if video_id:
+    if not video_id:
+        raise Exception("Не удалось распознать ID видео. Проверьте ссылку.")
+
+    try:
+        # Попытка 1: Ищем субтитры на нужных языках
+        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
+        return " ".join([item['text'] for item in transcript_list])
+    except Exception:
         try:
-            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
-            return " ".join([item['text'] for item in transcript_list])
+            # Попытка 2: Ищем любые доступные субтитры (включая автосгенерированные)
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
+            return " ".join([item['text'] for item in transcript.fetch()])
         except Exception:
-            try:
-                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-                transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
-                return " ".join([item['text'] for item in transcript.fetch()])
-            except Exception:
-                pass  # Субтитров нет, переходим к скачиванию аудио
-
-    # Попытка 2: Скачивание аудио через yt-dlp с эмуляцией клиентом Android VR (обход PoToken)
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        out_tmpl = os.path.join(tmp_dir, "audio.%(ext)s")
-        
-        ydl_opts = {
-            'format': 'm4a/bestaudio/best',
-            'outtmpl': out_tmpl,
-            'quiet': True,
-            'no_warnings': True,
-            'nocheckcertificate': True,
-            # Ключевой параметр для обхода PoToken и ошибки SABR:
-            'extractor_args': {
-                'youtube': {
-                    'player_client': ['android_vr', 'web'],
-                    'player_skip': ['webpage', 'configs'],
-                }
-            },
-            'http_headers': {
-                'User-Agent': 'Mozilla/5.0 (Android 12; Mobile; rv:109.0) Gecko/114.0 Firefox/114.0',
-            }
-        }
-        
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(video_url, download=True)
-                downloaded_file = ydl.prepare_filename(info)
-
-            if not os.path.exists(downloaded_file):
-                raise Exception("Файл не был сохранен.")
-
-            # Отправляем аудио на распознавание в Groq Whisper
-            return processor.transcribe_audio(downloaded_file)
-
-        except Exception as e:
-            raise Exception(f"Не удалось извлечь контент из видео. Убедитесь, что у видео есть субтитры или запустите обработку через аудиофайл. Ошибка: {str(e)}")
-        
+            # Отдаем красивую ошибку вместо падения приложения
+            raise Exception(
+                "У этого видео нет встроенных субтитров, а YouTube блокирует прямое скачивание звука. "
+                "Пожалуйста, скачайте аудио из этого видео (например, через любой онлайн-конвертер YouTube to MP3) "
+                "и загрузите его через вкладку загрузки аудиофайла."
+            )
+            
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
     for i in range(retries):
