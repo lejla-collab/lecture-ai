@@ -76,13 +76,13 @@ def extract_youtube_id(url: str) -> str:
 
 
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
-    """Безопасный вызов Gemini API с повторными попытками при 503 ошибке"""
+    """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
     for i in range(retries):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
             return response.text
         except Exception as e:
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
+            if "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e):
                 if i < retries - 1:
                     time.sleep(delay * (i + 1))
                     continue
@@ -93,7 +93,8 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-2.5-flash"
+        # Актуальная модель Gemini 3.6 Flash
+        self.gemini_model = "gemini-3.6-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
