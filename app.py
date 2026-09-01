@@ -12,6 +12,7 @@ import streamlit as st
 from google import genai
 from groq import Groq
 from youtube_transcript_api import YouTubeTranscriptApi
+import subprocess
 
 GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
@@ -75,21 +76,41 @@ def extract_youtube_id(url: str) -> str:
         return parsed.path.lstrip("/")
     return None
 
-def get_youtube_transcript(video_id: str) -> str:
-    """Извлекает субтитры из YouTube видео"""
-    try:
-        # Пробуем получить субтитры на русском, казахском или английском
-        transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
-        return " ".join([item['text'] for item in transcript_list])
-    except Exception:
-        # Если указанных языков нет, берем любые доступные субтитры
+def get_youtube_transcript_or_audio(video_url: str, processor: LectureProcessor) -> str:
+    """Пробует забрать субтитры. Если их нет — скачивает аудио и транскрибирует через Groq."""
+    video_id = extract_youtube_id(video_url)
+    
+    # Попытка 1: Загрузка субтитров
+    if video_id:
         try:
-            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
-            return " ".join([item['text'] for item in transcript.fetch()])
-        except Exception as e:
-            raise Exception("Не удалось загрузить субтитры. Убедитесь, что у видео включены субтитры на YouTube.")
-            
+            transcript_list = YouTubeTranscriptApi.get_transcript(video_id, languages=['ru', 'kk', 'en'])
+            return " ".join([item['text'] for item in transcript_list])
+        except Exception:
+            try:
+                transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+                transcript = transcript_list.find_transcript(['ru', 'kk', 'en', 'auto'])
+                return " ".join([item['text'] for item in transcript.fetch()])
+            except Exception:
+                pass  # Субтитров нет, переходим к скачиванию аудио
+
+    # Попытка 2: Скачивание аудио через yt-dlp + Groq Whisper
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        out_path = os.path.join(tmp_dir, "yt_audio.mp3")
+        # Скачиваем аудио с низкой битрейт-нагрузкой для быстроты
+        cmd = [
+            "yt-dlp",
+            "-x",
+            "--audio-format", "mp3",
+            "--audio-quality", "5",
+            "-o", out_path,
+            video_url
+        ]
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        
+        if result.returncode != 0 or not os.path.exists(out_path):
+            raise Exception("Не удалось извлечь аудио из видео. Проверьте доступность видео.")
+
+        return processor.transcribe_audio(out_path)       
 
 def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
     """Безопасный вызов Gemini API с повторными попытками при 503/429 ошибках"""
@@ -527,39 +548,32 @@ def main():
         youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
 
         if youtube_url.strip() and st.button("🚀 Начать обработку YouTube видео", type="primary"):
-            video_id = extract_youtube_id(youtube_url)
-            
-            if not video_id:
-                st.error("❌ Некорректная ссылка на YouTube видео.")
-            else:
-                try:
-                    # 1. Извлекаем субтитры
-                    with st.spinner("📜 Получение субтитров из видео..."):
-                        transcript_text = get_youtube_transcript(video_id)
+            try:
+                with st.spinner("📜 Получение субтитров / аудио из видео..."):
+                    transcript_text = get_youtube_transcript_or_audio(youtube_url, processor)
 
-                    # 2. Передаем РЕАЛЬНЫЙ текст субтитров в Gemini
-                    with st.spinner("🤖 Gemini анализирует текст и создает конспект и тесты..."):
-                        summary_md, quiz_json = processor.generate_content_and_quiz(
-                            text_or_url=transcript_text, target_lang=selected_lang, is_youtube=False
-                        )
+                with st.spinner("🤖 Gemini анализирует текст и создает конспект и тесты..."):
+                    summary_md, quiz_json = processor.generate_content_and_quiz(
+                        text_or_url=transcript_text, target_lang=selected_lang, is_youtube=False
+                    )
 
-                    st.session_state.summary_md = summary_md
-                    st.session_state.quiz_block1 = quiz_json.get("block1", [])
-                    st.session_state.quiz_block2 = quiz_json.get("block2", [])
-                    st.session_state.quiz_block3 = quiz_json.get("block3", [])
-                    st.session_state.raw_transcript = transcript_text
-                    st.session_state.current_youtube_url = youtube_url
+                st.session_state.summary_md = summary_md
+                st.session_state.quiz_block1 = quiz_json.get("block1", [])
+                st.session_state.quiz_block2 = quiz_json.get("block2", [])
+                st.session_state.quiz_block3 = quiz_json.get("block3", [])
+                st.session_state.raw_transcript = transcript_text
+                st.session_state.current_youtube_url = youtube_url
 
-                    # Сброс состояния игры
-                    st.session_state.current_block = 1
-                    st.session_state.b1_idx = 0
-                    st.session_state.b2_idx = 0
-                    st.session_state.b3_idx = 0
-                    st.session_state.total_score = 0
-                    st.session_state.show_explanation = False
+                # Сброс состояния игры
+                st.session_state.current_block = 1
+                st.session_state.b1_idx = 0
+                st.session_state.b2_idx = 0
+                st.session_state.b3_idx = 0
+                st.session_state.total_score = 0
+                st.session_state.show_explanation = False
 
-                except Exception as e:
-                    st.error(f"❌ Ошибка при обработке видео: {str(e)}")
+            except Exception as e:
+                st.error(f"❌ Ошибка при обработке видео: {str(e)}")
                     
     # Отображение результатов
     if "summary_md" in st.session_state:
