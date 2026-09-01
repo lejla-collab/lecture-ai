@@ -200,7 +200,7 @@ class LectureProcessor:
 
 ТРЕБОВАНИЯ К 3 БЛОКАМ ПРОВЕРКИ ЗНАНИЙ (JSON):
 - БЛОК 1: 10 подробных вопросов с 4 вариантами ответов (A, B, C, D) для ключевой проверки.
-- БЛОК 2: Квиз из 4-5 вопросов с 4 вариантами ответов (A, B, C, D) и детальным объяснением.
+- БЛОК 2: Квиз из 5 вопросов с заполнением пропусков. Формулируй вопрос с пропуском "[ ... ]", например: "В 1917 году произошло [ ... ], которое изменило ход истории." и давай 4 варианта ответов.
 - БЛОК 3: 5 вопросов формата "Верно или Неверно" (True / False).
 
 ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА:
@@ -370,51 +370,72 @@ def render_quiz_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # БЛОК 2: КВИЗ (4-5 ВОПРОСОВ)
+# БЛОК 2: КВИЗ С ВЫПАДАЮЩИМИ СПИСКАМИ (ЗАПОЛНЕНИЕ ПРОПУСКОВ)
     elif curr_block == 2:
-        st.info("📌 **Блок 2 из 3: Быстрый Квиз**")
-        idx = st.session_state.b2_idx
-        total_q = len(b2)
-
-        if idx >= total_q:
-            st.success("🎉 Блок 2 завершен! Переходим к Блоку 3 (Верно / Неверно)...")
-            if st.button("Перейти к Блоку 3 ➡️", type="primary"):
-                st.session_state.current_block = 3
-                st.session_state.show_explanation = False
-                st.rerun()
+        st.info("📌 **Блок 2 из 3: Квиз с заполнением пропусков (5 вопросов)**")
+        
+        if not b2:
+            st.warning("Нет вопросов для Блока 2.")
             return
 
-        item = b2[idx]
-        st.progress((idx) / total_q)
-        st.caption(f"Вопрос {idx + 1} из {total_q} | Очки: {st.session_state.total_score}")
+        # Используем форму, чтобы проверить все 5 ответов одновременно
+        with st.form(key="block2_form"):
+            user_answers = []
+            
+            for i, q in enumerate(b2):
+                st.markdown(f"**Вопрос {i + 1}:** {q['question']}")
+                
+                # Создаем список вариантов с плейсхолдером вначале
+                options = ["-- Нажмите, чтобы выбрать ответ --"] + q["options"]
+                
+                # Выпадающий список (selectbox), делающий эффект "нажатия на пробел"
+                selected = st.selectbox(
+                    label=f"Выберите ответ для вопроса №{i + 1}:",
+                    options=options,
+                    key=f"b2_select_{i}",
+                    disabled=st.session_state.show_explanation # Блокируем выбор после проверки
+                )
+                user_answers.append(selected)
+                st.write("") # Небольшой отступ между вопросами
 
-        st.markdown(f"#### ⚡ {item['question']}")
-        selected = st.radio(
-            "Ваш ответ:",
-            options=item["options"],
-            key=f"b2_q_{idx}",
-            disabled=st.session_state.show_explanation,
-        )
+            submit_btn = st.form_submit_button("✅ Проверить ответы", type="primary", disabled=st.session_state.show_explanation)
 
-        if not st.session_state.show_explanation:
-            if st.button("✅ Ответить", type="primary", key=f"b2_btn_{idx}"):
-                selected_idx = item["options"].index(selected)
-                is_correct = selected_idx == item["correct_index"]
-                st.session_state.is_correct = is_correct
-                st.session_state.show_explanation = True
-                if is_correct:
-                    st.session_state.total_score += 1
-                st.rerun()
-        else:
-            if st.session_state.is_correct:
-                st.success("🎉 **Отлично!**")
+        # Обработка нажатия кнопки "Проверить"
+        if submit_btn:
+            # Проверяем, на все ли вопросы ответил пользователь
+            if any(ans == "-- Нажмите, чтобы выбрать ответ --" for ans in user_answers):
+                st.warning("⚠️ Пожалуйста, закройте все пробелы (выберите варианты для каждого вопроса) перед проверкой!")
             else:
-                correct_text = item["options"][item["correct_index"]]
-                st.error(f"❌ **Ошибка.** Правильный вариант: **{correct_text}**")
-            st.info(f"💡 **Пояснение:** {item['explanation']}")
+                st.session_state.show_explanation = True
+                
+                # Подсчет баллов
+                score_for_b2 = 0
+                for i, q in enumerate(b2):
+                    correct_text = q["options"][q["correct_index"]]
+                    if user_answers[i] == correct_text:
+                        score_for_b2 += 1
+                        
+                st.session_state.total_score += score_for_b2
+                st.rerun()
 
-            if st.button("Следующий вопрос ➡️", type="primary", key=f"b2_next_{idx}"):
-                st.session_state.b2_idx += 1
+        # Показ результатов проверки (Зеленые / Красные подсветки)
+        if st.session_state.show_explanation:
+            st.markdown("### 📊 Результаты проверки Блока 2:")
+            
+            for i, q in enumerate(b2):
+                correct_text = q["options"][q["correct_index"]]
+                user_ans = user_answers[i] if i < len(user_answers) else ""
+                
+                if user_ans == correct_text:
+                    st.success(f"**Вопрос {i + 1}: ✅ Верно!**\n\nВаш ответ: *{user_ans}*")
+                else:
+                    st.error(f"**Вопрос {i + 1}: ❌ Неверно.**\n\nВаш ответ: *{user_ans}*\n\nПравильный ответ: **{correct_text}**")
+                
+                st.info(f"💡 **Пояснение:** {q['explanation']}")
+                st.markdown("---")
+
+            if st.button("Перейти к Блоку 3 ➡️", type="primary"):
+                st.session_state.current_block = 3
                 st.session_state.show_explanation = False
                 st.rerun()
 
