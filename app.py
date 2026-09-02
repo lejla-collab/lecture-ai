@@ -244,7 +244,7 @@ class LectureProcessor:
         progress_bar.empty()
         return "\n".join(full_transcript)
 
-    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
+def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
         lang_instructions: Dict[str, str] = {
             "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
             "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
@@ -305,27 +305,32 @@ class LectureProcessor:
 }}
 ===QUIZ_JSON_END===
 """
+        quiz_json = {"block1": [], "block2": [], "block3": []}
 
         try:
             raw_text = call_gemini_with_retry(
                 client=self.gemini_client,
-                model=self.gemini_model,  # "gemini-2.5-flash"
+                model=self.gemini_model,
                 prompt=prompt,
                 retries=4,
                 delay=4
             )
         except Exception as e:
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
-                st.warning("⚠️ Основная модель перегружена, переключаемся на резервную (Gemini 2.5 Pro)...")
-                raw_text = call_gemini_with_retry(
-                    client=self.gemini_client,
-                    model="gemini-2.5-pro",
-                    prompt=prompt,
-                    retries=3,
-                    delay=3
-                )
-            else:
-                raise e
+            # Перехват ошибки сервера Gemini (например, 503 или лимиты)
+            raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
+
+        summary_md = raw_text
+
+        if raw_text and "===QUIZ_JSON_START===" in raw_text and "===QUIZ_JSON_END===" in raw_text:
+            parts = raw_text.split("===QUIZ_JSON_START===")
+            summary_md = parts[0].strip()
+            json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
+            try:
+                quiz_json = json.loads(json_str)
+            except Exception as e:
+                st.error(f"Ошибка парсинга викторины: {e}")
+
+        return summary_md, quiz_json
 
 # ------------------------------------------------------------------------------
 # 5. ИНТЕРАКТИВНЫЙ ИГРОВОЙ МОДУЛЬ (QUIZ)
@@ -651,26 +656,45 @@ def main():
                 try:
                     with st.spinner("🎧 Расшифровка аудиозаписи (Groq Whisper)..."):
                         raw_transcript = processor.transcribe_audio(temp_audio_path)
+                    
+                    if not raw_transcript or not raw_transcript.strip():
+                        st.error("❌ Не удалось распознать текст из аудиофайла.")
+                        st.stop()
+
                     st.success("✅ Транскрибация завершена!")
 
                     with st.spinner("🤖 Gemini формирует структурированный конспект и 3 блока заданий..."):
-                        summary_md, quiz_json = processor.generate_content_and_quiz(
+                        res = processor.generate_content_and_quiz(
                             text_or_url=raw_transcript, target_lang=selected_lang, is_youtube=False
                         )
+                        if not res:
+                            raise ValueError("Модель не вернула ответ.")
+                        summary_md, quiz_json = res
 
-                    st.session_state.summary_md = summary_md
-                    st.session_state.quiz_block1 = quiz_json.get("block1", [])
-                    st.session_state.quiz_block2 = quiz_json.get("block2", [])
-                    st.session_state.quiz_block3 = quiz_json.get("block3", [])
+                    # Безопасная запись в session_state
+                    st.session_state.summary_md = summary_md or ""
+                    
+                    if isinstance(quiz_json, dict):
+                        st.session_state.quiz_block1 = quiz_json.get("block1", [])
+                        st.session_state.quiz_block2 = quiz_json.get("block2", [])
+                        st.session_state.quiz_block3 = quiz_json.get("block3", [])
+                    else:
+                        st.session_state.quiz_block1 = []
+                        st.session_state.quiz_block2 = []
+                        st.session_state.quiz_block3 = []
+
                     st.session_state.raw_transcript = raw_transcript
                     st.session_state.current_youtube_url = None
 
-                    # Извлечение заголовка из markdown
-                    first_line = summary_md.split("\n")[0].replace("#", "").strip()
-                    lecture_title = first_line if first_line else uploaded_file.name
+                    # Извлечение заголовка из markdown с защитой от None
+                    lecture_title = uploaded_file.name
+                    if summary_md and summary_md.strip():
+                        first_line = summary_md.strip().split("\n")[0].replace("#", "").strip()
+                        if first_line:
+                            lecture_title = first_line
 
                     # Сохранение в Supabase
-                    save_lecture_to_db(user_email, lecture_title, summary_md, quiz_json, raw_transcript)
+                    save_lecture_to_db(user_email, lecture_title, st.session_state.summary_md, quiz_json, raw_transcript)
 
                     # Сброс состояния игры
                     st.session_state.current_block = 1
@@ -680,12 +704,14 @@ def main():
                     st.session_state.total_score = 0
                     st.session_state.show_explanation = False
 
+                    # Перезапуск приложения для мгновенного отображения результатов
+                    st.rerun()
+
                 except Exception as e:
                     st.error(f"❌ Ошибка при обработке аудио: {str(e)}")
                 finally:
                     if os.path.exists(temp_audio_path):
                         os.remove(temp_audio_path)
-
         # Вариант 2: Ссылка на YouTube
         else:
             youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
