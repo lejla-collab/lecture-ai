@@ -1,10 +1,11 @@
 import io
 import json
 import os
+import random
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import docx
@@ -27,7 +28,6 @@ st.set_page_config(
 st.markdown(
     """
     <style>
-    /* Скрывает кнопку Deploy */
     [data-testid="stAppDeployButton"], .stDeployButton {
         display: none !important;
     }
@@ -46,7 +46,6 @@ SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
 
 MAX_FILE_SIZE_BYTES = 18 * 1024 * 1024
 
-# Инициализация Supabase клиента
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -88,7 +87,6 @@ if "is_correct" not in st.session_state:
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И БАЗА ДАННЫХ
 # ------------------------------------------------------------------------------
 def extract_youtube_id(url: str) -> Optional[str]:
-    """Извлекает ID видео из любых ссылок YouTube"""
     parsed = urlparse(url)
     if parsed.hostname in ("www.youtube.com", "youtube.com"):
         if parsed.path == "/watch":
@@ -100,8 +98,7 @@ def extract_youtube_id(url: str) -> Optional[str]:
     return None
 
 
-def get_youtube_transcript_or_audio(video_url: str, processor: "LectureProcessor") -> str:
-    """Получает субтитры через надежный сторонний API Supadata"""
+def get_youtube_transcript_or_audio(video_url: str) -> str:
     api_key = st.secrets.get("SUPADATA_API_KEY", "")
     if not api_key:
         raise Exception("Не найден SUPADATA_API_KEY в настройках st.secrets.")
@@ -121,20 +118,23 @@ def get_youtube_transcript_or_audio(video_url: str, processor: "LectureProcessor
     return " ".join([item.get("text", "") for item in content])
 
 
-def call_gemini_with_retry(client, model, prompt, retries=5, delay=5):
-    """Безопасный вызов Gemini API с повторными попытками при перегрузке (503)"""
-    for i in range(retries):
+def call_gemini_with_retry(client, model, prompt, retries=6, base_delay=3):
+    """Экспоненциальная задержка + Jitter для защиты от 503 UNAVAILABLE"""
+    for attempt in range(retries):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
-            return response.text
+            if response and response.text:
+                return response.text
         except Exception as e:
-            # Если сервер перегружен (503), превышен лимит (429) или модель недоступна
-            if any(err in str(e) for err in ["503", "UNAVAILABLE", "429"]):
-                if i < retries - 1:
-                    sleep_time = delay * (i + 1)  # Нарастающая пауза: 5с, 10с, 15с, 20с
+            err_msg = str(e)
+            if any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
+                if attempt < retries - 1:
+                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0.5, 1.5)
                     time.sleep(sleep_time)
                     continue
             raise e
+    raise RuntimeError("Не удалось получить стабильный ответ от Gemini API после нескольких попыток.")
+
 
 def create_docx_bytes(markdown_text: str) -> bytes:
     doc = docx.Document()
@@ -161,7 +161,6 @@ def create_docx_bytes(markdown_text: str) -> bytes:
 
 
 def save_lecture_to_db(user_email: str, title: str, summary_md: str, quiz_json: dict, raw_transcript: str, youtube_url: Optional[str] = None):
-    """Сохраняет сгенерированную лекцию в базу данных Supabase"""
     if not supabase or user_email == "guest@guest.com":
         return
 
@@ -181,7 +180,6 @@ def save_lecture_to_db(user_email: str, title: str, summary_md: str, quiz_json: 
 
 
 def load_user_lectures(user_email: str):
-    """Загружает список конспектов пользователя из Supabase"""
     if not supabase or user_email == "guest@guest.com":
         return []
     try:
@@ -198,7 +196,8 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-3.6-flash"
+        # Стабильная модель Gemini 2.5 Flash
+        self.gemini_model = "gemini-2.5-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
@@ -244,7 +243,7 @@ class LectureProcessor:
         progress_bar.empty()
         return "\n".join(full_transcript)
 
-    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
+    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False) -> Tuple[str, dict]:
         lang_instructions: Dict[str, str] = {
             "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
             "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
@@ -252,82 +251,54 @@ class LectureProcessor:
             "en": "Составь весь материал СТРОГО на английском языке (English).",
         }
         instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
-        source_prompt = f"Посмотри и проанализируй это видео на YouTube: {text_or_url}" if is_youtube else f"Текст лекции для анализа:\n{text_or_url}"
+        source_prompt = f"Ссылка/текст лекции:\n{text_or_url[:15000]}"  # Ограничение длины во избежание перегрузок
 
-        prompt = f"""
-Ты — высококлассный преподаватель и методист.
-{source_prompt}
-
-Твоя задача — составить наглядно структурированный, разложенный "по полочкам" конспект и проверку знаний из 3 блоков.
-
-ЯЗЫКОВОЕ ТРЕБОВАНИЕ:
+        # ЭТАП 1: Создание конспекта
+        summary_prompt = f"""
+Ты — методист. Проанализируй текст лекции и составь структурированный конспект.
 {instruction}
 
 ТРЕБОВАНИЯ К КОНСПЕКТУ:
-1. Максимально подробный и понятный для студента. Придумай в самом начале краткий емкий Заголовок лекции (Заголовок 1 класса #).
-2. Используй таблицы сравнений, структурированные списки, выдели ключевые даты, термины и примеры из практики.
-3. Оформи схематичный кластер (логическую связь основных тем лекции).
+1. Заголовок лекции (# Название).
+2. Подробное структурированное изложение с подзаголовками, таблицами, списками и примерами.
+3. Логический кластер / концептуальная схема в виде текстового блока.
 
-ТРЕБОВАНИЯ К 3 БЛОКАМ ПРОВЕРКИ ЗНАНИЙ (JSON):
-- БЛОК 1: 10 подробных вопросов с 4 вариантами ответов (A, B, C, D) для ключевой проверки.
-- БЛОК 2: Квиз из 5 вопросов с заполнением пропусков. Формулируй вопрос с пропуском "[ ... ]", например: "В 1917 году произошло [ ... ], которое изменило ход истории." и давай 4 варианта ответов.
-- БЛОК 3: 5 вопросов формата "Верно или Неверно" (True / False).
+Лекция:
+{source_prompt}
+"""
+        summary_md = call_gemini_with_retry(self.gemini_client, self.gemini_model, summary_prompt)
 
-ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА:
-Сначала напиши подробный конспект в формате Markdown.
-В самом конце напиши JSON строго в следующем формате:
+        # ЭТАП 2: Быстрая генерация викторины в JSON
+        quiz_prompt = f"""
+На основе конспекта сформируй JSON-викторину из 3 блоков.
+{instruction}
 
-===QUIZ_JSON_START===
+ВЫВЕДИ ТОЛЬКО ВАЛИДНЫЙ JSON БЕЗ МАРКДАУН-РАЗМЕТКИ В ФОРМАТЕ:
 {{
   "block1": [
-    {{
-      "question": "Текст вопроса 1?",
-      "options": ["Вариант A", "Вариант B", "Вариант C", "Вариант D"],
-      "correct_index": 0,
-      "explanation": "Подробное пояснение ответов."
-    }}
+    {{"question": "Вопрос?", "options": ["A", "B", "C", "D"], "correct_index": 0, "explanation": "Пояснение"}}
   ],
   "block2": [
-    {{
-      "question": "Вопрос квиза 1?",
-      "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"],
-      "correct_index": 1,
-      "explanation": "Пояснение квиза."
-    }}
+    {{"question": "В 1917 году произошло [ ... ], новое событие.", "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"], "correct_index": 1, "explanation": "Пояснение"}}
   ],
   "block3": [
-    {{
-      "statement": "Утверждение для проверки",
-      "is_true": true,
-      "explanation": "Почему это правда или ложь."
-    }}
+    {{"statement": "Утверждение", "is_true": true, "explanation": "Пояснение"}}
   ]
 }}
-===QUIZ_JSON_END===
+
+Количество: block1 (5-10 вопросов), block2 (5 вопросов), block3 (5 вопросов).
+
+Конспект для вопросов:
+{summary_md[:4000]}
 """
+        raw_quiz = call_gemini_with_retry(self.gemini_client, self.gemini_model, quiz_prompt)
+        
         quiz_json = {"block1": [], "block2": [], "block3": []}
-
         try:
-            raw_text = call_gemini_with_retry(
-                client=self.gemini_client,
-                model=self.gemini_model,
-                prompt=prompt,
-                retries=4,
-                delay=4
-            )
+            cleaned_json_str = re.sub(r"```json|```", "", raw_quiz).strip()
+            quiz_json = json.loads(cleaned_json_str)
         except Exception as e:
-            raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
-
-        summary_md = raw_text
-
-        if raw_text and "===QUIZ_JSON_START===" in raw_text and "===QUIZ_JSON_END===" in raw_text:
-            parts = raw_text.split("===QUIZ_JSON_START===")
-            summary_md = parts[0].strip()
-            json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
-            try:
-                quiz_json = json.loads(json_str)
-            except Exception as e:
-                st.error(f"Ошибка парсинга викторины: {e}")
+            st.warning(f"⚠️ Ошибка считывания викторины, повторите попытку позже: {e}")
 
         return summary_md, quiz_json
 
@@ -347,7 +318,6 @@ def render_quiz_game():
 
     curr_block = st.session_state.current_block
 
-    # ЭКРАН ФИНАЛА
     if curr_block > 3:
         st.balloons()
         max_score = len(b1) + len(b2) + len(b3)
@@ -376,9 +346,8 @@ def render_quiz_game():
             st.rerun()
         return
 
-    # БЛОК 1: ОСНОВНОЙ ТЕСТ
     if curr_block == 1:
-        st.info("📌 **Блок 1 из 3: Вопросы по материалу (10 вопросов)**")
+        st.info("📌 **Блок 1 из 3: Вопросы по материалу**")
         idx = st.session_state.b1_idx
         total_q = len(b1)
 
@@ -424,9 +393,8 @@ def render_quiz_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # БЛОК 2: КВИЗ С ВЫПАДАЮЩИМИ СПИСКАМИ
     elif curr_block == 2:
-        st.info("📌 **Блок 2 из 3: Квиз с заполнением пропусков (5 вопросов)**")
+        st.info("📌 **Блок 2 из 3: Квиз с заполнением пропусков**")
         if not b2:
             st.warning("Нет вопросов для Блока 2.")
             return
@@ -477,7 +445,6 @@ def render_quiz_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-    # БЛОК 3: ВЕРНО / НЕВЕРНО
     elif curr_block == 3:
         st.info("📌 **Блок 3 из 3: Верно или Неверно (True / False)**")
         idx = st.session_state.b3_idx
@@ -526,20 +493,20 @@ def render_quiz_game():
                 st.rerun()
 
 # ------------------------------------------------------------------------------
-# 6. ОКТРАН «ЛИЧНЫЙ КАБИНЕТ»
+# 6. ЭКРАН «ЛИЧНЫЙ КАБИНЕТ»
 # ------------------------------------------------------------------------------
 def render_dashboard(user_email: str):
     st.title("📂 Личный кабинет")
     st.subheader(f"История конспектов пользователя: `{user_email}`")
 
     if user_email == "guest@guest.com":
-        st.warning("⚠️ Вы вошли в режиме Гостя. История конспектов не сохраняется в базе данных. Пожалуйста, авторизуйтесь через Google для сохранения лекций.")
+        st.warning("⚠️ Вы вошли в режиме Гостя. История конспектов не сохраняется в базе данных.")
         return
 
     lectures = load_user_lectures(user_email)
 
     if not lectures:
-        st.info("У вас пока нет сохраненных конспектов. Создайте свой первый конспект на главной странице!")
+        st.info("У вас пока нет сохраненных конспектов.")
         return
 
     for lec in lectures:
@@ -556,15 +523,13 @@ def render_dashboard(user_email: str):
             )
 
 # ------------------------------------------------------------------------------
-# 7. ОСНОВНАЯ ЛОГИКА И ЭКРАН АВТОРИЗАЦИИ
+# 7. ОСНОВНАЯ ЛОГИКА
 # ------------------------------------------------------------------------------
 def main():
-# Проверка авторизации Streamlit (Google Auth)
     is_logged_in = False
     user_email = ""
     user_name = "Пользователь"
 
-    # Безопасная проверка авторизации
     try:
         user_info = getattr(st, "user", None) or getattr(st, "experimental_user", None)
         if user_info and getattr(user_info, "is_logged_in", False):
@@ -579,9 +544,10 @@ def main():
         user_email = "guest@guest.com"
         user_name = "Гость"
 
+    if not is_logged_in:
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.info("🔑 Авторизуйтесь, чтобы сохранять созданные конспекты в личном кабинете.")
+            st.info("🔑 Авторизуйтесь, чтобы сохранять созданные конспекты.")
             if st.button("🚀 Войти через Google", type="primary", use_container_width=True):
                 st.login()
 
@@ -592,7 +558,6 @@ def main():
                 st.rerun()
         return
 
-    # --- ВНУТРЕННИЙ ИНТЕРФЕЙС (Sidebar & Tabs) ---
     with st.sidebar:
         st.title("👤 Профиль")
         st.write(f"**Имя:** {user_name}")
@@ -619,7 +584,6 @@ def main():
             }[x],
         )
 
-    # Переключение главных вкладок
     main_tab1, main_tab2 = st.tabs(["🚀 Создать конспект", "📂 Личный кабинет"])
 
     with main_tab2:
@@ -627,9 +591,8 @@ def main():
 
     with main_tab1:
         st.title("🎓 Lecture AI — Генерация & Тестирование")
-        st.caption("Автоматическое создание наглядных конспектов и интерактивной проверки знаний по аудио и видео лекциям.")
+        st.caption("Автоматическое создание наглядных конспектов и интерактивной проверки знаний.")
 
-        # Выбор источника лекции
         source_type = st.radio(
             "Выберите способ загрузки лекции:",
             ("Загрузить аудиофайл", "Ссылка на YouTube"),
@@ -638,7 +601,6 @@ def main():
 
         processor = LectureProcessor()
 
-        # Вариант 1: Загрузить аудиофайл
         if source_type == "Загрузить аудиофайл":
             uploaded_file = st.file_uploader(
                 "Загрузите аудиозапись лекции (MP3, WAV, M4A, OGG)",
@@ -662,40 +624,27 @@ def main():
 
                     st.success("✅ Транскрибация завершена!")
 
-                    with st.spinner("🤖 Gemini формирует структурированный конспект и 3 блока заданий..."):
-                        res = processor.generate_content_and_quiz(
+                    with st.spinner("🤖 Gemini формирует конспект и викторину..."):
+                        summary_md, quiz_json = processor.generate_content_and_quiz(
                             text_or_url=raw_transcript, target_lang=selected_lang, is_youtube=False
                         )
-                        if not res:
-                            raise ValueError("Модель не вернула ответ.")
-                        summary_md, quiz_json = res
 
-                    # Безопасная запись в session_state
                     st.session_state.summary_md = summary_md or ""
-                    
-                    if isinstance(quiz_json, dict):
-                        st.session_state.quiz_block1 = quiz_json.get("block1", [])
-                        st.session_state.quiz_block2 = quiz_json.get("block2", [])
-                        st.session_state.quiz_block3 = quiz_json.get("block3", [])
-                    else:
-                        st.session_state.quiz_block1 = []
-                        st.session_state.quiz_block2 = []
-                        st.session_state.quiz_block3 = []
+                    st.session_state.quiz_block1 = quiz_json.get("block1", [])
+                    st.session_state.quiz_block2 = quiz_json.get("block2", [])
+                    st.session_state.quiz_block3 = quiz_json.get("block3", [])
 
                     st.session_state.raw_transcript = raw_transcript
                     st.session_state.current_youtube_url = None
 
-                    # Извлечение заголовка из markdown с защитой от None
                     lecture_title = uploaded_file.name
                     if summary_md and summary_md.strip():
                         first_line = summary_md.strip().split("\n")[0].replace("#", "").strip()
                         if first_line:
                             lecture_title = first_line
 
-                    # Сохранение в Supabase
                     save_lecture_to_db(user_email, lecture_title, st.session_state.summary_md, quiz_json, raw_transcript)
 
-                    # Сброс состояния игры
                     st.session_state.current_block = 1
                     st.session_state.b1_idx = 0
                     st.session_state.b2_idx = 0
@@ -703,7 +652,6 @@ def main():
                     st.session_state.total_score = 0
                     st.session_state.show_explanation = False
 
-                    # Перезапуск приложения для мгновенного отображения результатов
                     st.rerun()
 
                 except Exception as e:
@@ -711,18 +659,17 @@ def main():
                 finally:
                     if os.path.exists(temp_audio_path):
                         os.remove(temp_audio_path)
-        # Вариант 2: Ссылка на YouTube
         else:
             youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
 
             if youtube_url.strip() and st.button("🚀 Начать обработку YouTube видео", type="primary"):
                 try:
-                    with st.spinner("📜 Получение субтитров / аудио из видео..."):
-                        transcript_text = get_youtube_transcript_or_audio(youtube_url, processor)
+                    with st.spinner("📜 Получение субтитров из видео..."):
+                        transcript_text = get_youtube_transcript_or_audio(youtube_url)
 
                     with st.spinner("🤖 Gemini анализирует текст и создает конспект и тесты..."):
                         summary_md, quiz_json = processor.generate_content_and_quiz(
-                            text_or_url=transcript_text, target_lang=selected_lang, is_youtube=False
+                            text_or_url=transcript_text, target_lang=selected_lang, is_youtube=True
                         )
 
                     st.session_state.summary_md = summary_md
@@ -732,14 +679,11 @@ def main():
                     st.session_state.raw_transcript = transcript_text
                     st.session_state.current_youtube_url = youtube_url
 
-                    # Извлечение заголовка из markdown
                     first_line = summary_md.split("\n")[0].replace("#", "").strip()
                     lecture_title = first_line if first_line else "YouTube Лекция"
 
-                    # Сохранение в Supabase
                     save_lecture_to_db(user_email, lecture_title, summary_md, quiz_json, transcript_text, youtube_url)
 
-                    # Сброс состояния игры
                     st.session_state.current_block = 1
                     st.session_state.b1_idx = 0
                     st.session_state.b2_idx = 0
@@ -747,10 +691,11 @@ def main():
                     st.session_state.total_score = 0
                     st.session_state.show_explanation = False
 
+                    st.rerun()
+
                 except Exception as e:
                     st.error(f"❌ Ошибка при обработке видео: {str(e)}")
 
-        # Отображение результатов текущего сеанса
         if "summary_md" in st.session_state:
             st.markdown("---")
             tab_summary, tab_game, tab_transcript = st.tabs(
