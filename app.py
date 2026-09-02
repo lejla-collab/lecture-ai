@@ -198,7 +198,7 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-3.6-flash"
+        self.gemini_model = "gemini-2.5-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
@@ -244,7 +244,7 @@ class LectureProcessor:
         progress_bar.empty()
         return "\n".join(full_transcript)
 
-def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
+    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False):
         lang_instructions: Dict[str, str] = {
             "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
             "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
@@ -316,7 +316,6 @@ def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtu
                 delay=4
             )
         except Exception as e:
-            # Перехват ошибки сервера Gemini (например, 503 или лимиты)
             raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
 
         summary_md = raw_text
