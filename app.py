@@ -121,19 +121,20 @@ def get_youtube_transcript_or_audio(video_url: str, processor: "LectureProcessor
     return " ".join([item.get("text", "") for item in content])
 
 
-def call_gemini_with_retry(client, model, prompt, retries=3, delay=3):
-    """Безопасный вызов Gemini API с повторными попытками"""
+def call_gemini_with_retry(client, model, prompt, retries=5, delay=5):
+    """Безопасный вызов Gemini API с повторными попытками при перегрузке (503)"""
     for i in range(retries):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
             return response.text
         except Exception as e:
+            # Если сервер перегружен (503), превышен лимит (429) или модель недоступна
             if any(err in str(e) for err in ["503", "UNAVAILABLE", "429"]):
                 if i < retries - 1:
-                    time.sleep(delay * (i + 1))
+                    sleep_time = delay * (i + 1)  # Нарастающая пауза: 5с, 10с, 15с, 20с
+                    time.sleep(sleep_time)
                     continue
             raise e
-
 
 def create_docx_bytes(markdown_text: str) -> bytes:
     doc = docx.Document()
@@ -304,25 +305,27 @@ class LectureProcessor:
 }}
 ===QUIZ_JSON_END===
 """
-        raw_text = call_gemini_with_retry(
-            client=self.gemini_client,
-            model=self.gemini_model,
-            prompt=prompt
-        )
 
-        summary_md = raw_text
-        quiz_json = {"block1": [], "block2": [], "block3": []}
-
-        if "===QUIZ_JSON_START===" in raw_text and "===QUIZ_JSON_END===" in raw_text:
-            parts = raw_text.split("===QUIZ_JSON_START===")
-            summary_md = parts[0].strip()
-            json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
-            try:
-                quiz_json = json.loads(json_str)
-            except Exception as e:
-                st.error(f"Ошибка парсинга викторины: {e}")
-
-        return summary_md, quiz_json
+        try:
+            raw_text = call_gemini_with_retry(
+                client=self.gemini_client,
+                model=self.gemini_model,  # "gemini-2.5-flash"
+                prompt=prompt,
+                retries=4,
+                delay=4
+            )
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                st.warning("⚠️ Основная модель перегружена, переключаемся на резервную (Gemini 2.5 Pro)...")
+                raw_text = call_gemini_with_retry(
+                    client=self.gemini_client,
+                    model="gemini-2.5-pro",
+                    prompt=prompt,
+                    retries=3,
+                    delay=3
+                )
+            else:
+                raise e
 
 # ------------------------------------------------------------------------------
 # 5. ИНТЕРАКТИВНЫЙ ИГРОВОЙ МОДУЛЬ (QUIZ)
