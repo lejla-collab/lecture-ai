@@ -198,7 +198,7 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-2.5-flash"
+        self.gemini_model = "gemini-3.6-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
