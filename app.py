@@ -552,25 +552,25 @@ def render_dashboard(user_email: str):
 # 7. ОСНОВНАЯ ЛОГИКА И ЭКРАН АВТОРИЗАЦИИ
 # ------------------------------------------------------------------------------
 def main():
-    # Проверка авторизации Streamlit (Google Auth)
+# Проверка авторизации Streamlit (Google Auth)
     is_logged_in = False
     user_email = ""
     user_name = "Пользователь"
 
-    if hasattr(st, "user") and st.user.is_logged_in:
-        is_logged_in = True
-        user_email = st.user.email
-        user_name = st.user.name or st.user.email
-    elif st.session_state.guest_mode:
+    # Безопасная проверка авторизации
+    try:
+        user_info = getattr(st, "user", None) or getattr(st, "experimental_user", None)
+        if user_info and getattr(user_info, "is_logged_in", False):
+            is_logged_in = True
+            user_email = getattr(user_info, "email", "")
+            user_name = getattr(user_info, "name", "") or user_email
+    except AttributeError:
+        is_logged_in = False
+
+    if not is_logged_in and st.session_state.guest_mode:
         is_logged_in = True
         user_email = "guest@guest.com"
         user_name = "Гость"
-
-    # ЭКРАН ВХОДА (Если не авторизован и не Гость)
-    if not is_logged_in:
-        st.markdown("<h1 style='text-align: center;'>🎓 Lecture AI</h1>", unsafe_allow_html=True)
-        st.markdown("<h3 style='text-align: center;'> Умная генерация конспектов и интерактивных тестов по лекциям</h3>", unsafe_allow_html=True)
-        st.write("\n\n")
 
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
