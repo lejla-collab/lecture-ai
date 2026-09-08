@@ -177,7 +177,7 @@ def load_user_lectures(user_email: str):
 class LectureProcessor:
     def __init__(self, gemini_key: str = GEMINI_API_KEY):
         self.gemini_client = genai.Client(api_key=gemini_key)
-        self.gemini_model = "gemini-2.5-flash"
+        self.gemini_model = "gemini-3.6-flash"
 
     def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
         st.info("📤 Загрузка аудиофайла на сервер Gemini...")
