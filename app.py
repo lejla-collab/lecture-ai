@@ -119,7 +119,7 @@ def get_youtube_transcript_or_audio(video_url: str) -> str:
 
 
 def call_gemini_with_retry(client, model, prompt, retries=6, base_delay=3):
-    """Экспоненциальная задержка + Jitter для защиты от 503 UNAVAILABLE"""
+    """Экспоненциальная задержка + Jitter для защиты от ограничений и ошибок сети"""
     for attempt in range(retries):
         try:
             response = client.models.generate_content(model=model, contents=prompt)
@@ -196,8 +196,8 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        # Стабильная модель Gemini 2.5 Flash
-        self.gemini_model = "gemini-2.5-flash"
+        # Использование актуальной и рабочей модели Gemini 3.6 Flash
+        self.gemini_model = "gemini-3.6-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
@@ -251,54 +251,78 @@ class LectureProcessor:
             "en": "Составь весь материал СТРОГО на английском языке (English).",
         }
         instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
-        source_prompt = f"Ссылка/текст лекции:\n{text_or_url[:15000]}"  # Ограничение длины во избежание перегрузок
+        source_prompt = f"Ссылка/текст лекции:\n{text_or_url}"
 
-        # ЭТАП 1: Создание конспекта
-        summary_prompt = f"""
-Ты — методист. Проанализируй текст лекции и составь структурированный конспект.
+        prompt = f"""
+Ты — высококлассный академический эксперт, профессора и методист.
 {instruction}
+
+Твоя задача — тщательно проанализировать расшифровку лекции ниже и сделать из неё ИДЕАЛЬНЫЙ, ПОДРОБНЫЙ, ОБЪЁМНЫЙ КОНСПЕКТ и ТЕСТОВЫЕ ИГРЫ.
 
 ТРЕБОВАНИЯ К КОНСПЕКТУ:
-1. Заголовок лекции (# Название).
-2. Подробное структурированное изложение с подзаголовками, таблицами, списками и примерами.
-3. Логический кластер / концептуальная схема в виде текстового блока.
+1. **Заголовок**: Начни с яркого заголовка первой категории `# Название темы`.
+2. **Полнота и дополнение знаний**: Не просто пересказывай текст. Если в речи спикера есть недосказанности, пропущенные определения, формулировки или сложные термины — ДОПОЛНИ их профессиональной, понятной информацией из своих энциклопедических знаний, чтобы конспект стал на 100% полноценным учебным пособием.
+3. **Структура**:
+   - 📌 **Краткая аннотация**: О чем лекция и ключевой вывод.
+   - 📚 **Разбор основных разделов**: Подробный текст с подзаголовками (`##`), маркированными списками и выделением **жирным шрифтом** главных терминов и дат.
+   - 📊 **Сравнительная таблица / Кластер**: Используй таблицы Markdown для наглядности.
+   - 💡 **Примеры и практическое применение**: Как эти знания применяются на практике.
 
-Лекция:
-{source_prompt}
-"""
-        summary_md = call_gemini_with_retry(self.gemini_client, self.gemini_model, summary_prompt)
+СТРУКТУРА JSON ДЛЯ ВИКТОРИНЫ (В САМОМ КОНЦЕ ОТВЕТА):
+После завершения конспекта выведи специальный блок JSON для проверки знаний.
 
-        # ЭТАП 2: Быстрая генерация викторины в JSON
-        quiz_prompt = f"""
-На основе конспекта сформируй JSON-викторину из 3 блоков.
-{instruction}
+ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА:
+[Текст подробного конспекта в Markdown]
 
-ВЫВЕДИ ТОЛЬКО ВАЛИДНЫЙ JSON БЕЗ МАРКДАУН-РАЗМЕТКИ В ФОРМАТЕ:
+===QUIZ_JSON_START===
 {{
   "block1": [
-    {{"question": "Вопрос?", "options": ["A", "B", "C", "D"], "correct_index": 0, "explanation": "Пояснение"}}
+    {{
+      "question": "Вопрос с 4 вариантами?",
+      "options": ["Вариант A", "Вариант B", "Вариант C", "Вариант D"],
+      "correct_index": 0,
+      "explanation": "Подробное объяснение ответа."
+    }}
   ],
   "block2": [
-    {{"question": "В 1917 году произошло [ ... ], новое событие.", "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"], "correct_index": 1, "explanation": "Пояснение"}}
+    {{
+      "question": "Формулировка с пропуском [ ... ] для заполнения.",
+      "options": ["Вариант 1", "Вариант 2", "Вариант 3", "Вариант 4"],
+      "correct_index": 1,
+      "explanation": "Объяснение."
+    }}
   ],
   "block3": [
-    {{"statement": "Утверждение", "is_true": true, "explanation": "Пояснение"}}
+    {{
+      "statement": "Утверждение для проверки",
+      "is_true": true,
+      "explanation": "Почему это верно или неверно."
+    }}
   ]
 }}
+===QUIZ_JSON_END===
 
-Количество: block1 (5-10 вопросов), block2 (5 вопросов), block3 (5 вопросов).
+Количество вопросов: block1 (от 5 до 10 вопросов), block2 (5 вопросов), block3 (5 вопросов).
 
-Конспект для вопросов:
-{summary_md[:4000]}
+Исходный текст лекции:
+{source_prompt}
 """
-        raw_quiz = call_gemini_with_retry(self.gemini_client, self.gemini_model, quiz_prompt)
-        
-        quiz_json = {"block1": [], "block2": [], "block3": []}
         try:
-            cleaned_json_str = re.sub(r"```json|```", "", raw_quiz).strip()
-            quiz_json = json.loads(cleaned_json_str)
+            raw_response = call_gemini_with_retry(self.gemini_client, self.gemini_model, prompt)
         except Exception as e:
-            st.warning(f"⚠️ Ошибка считывания викторины, повторите попытку позже: {e}")
+            raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
+
+        summary_md = raw_response
+        quiz_json = {"block1": [], "block2": [], "block3": []}
+
+        if raw_response and "===QUIZ_JSON_START===" in raw_response and "===QUIZ_JSON_END===" in raw_response:
+            parts = raw_response.split("===QUIZ_JSON_START===")
+            summary_md = parts[0].strip()
+            json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
+            try:
+                quiz_json = json.loads(json_str)
+            except Exception as e:
+                st.warning(f"⚠️ Ошибка считывания структуры викторины: {e}")
 
         return summary_md, quiz_json
 
@@ -624,7 +648,7 @@ def main():
 
                     st.success("✅ Транскрибация завершена!")
 
-                    with st.spinner("🤖 Gemini формирует конспект и викторину..."):
+                    with st.spinner("🤖 Gemini формирует подробный конспект и проверяет знания..."):
                         summary_md, quiz_json = processor.generate_content_and_quiz(
                             text_or_url=raw_transcript, target_lang=selected_lang, is_youtube=False
                         )
