@@ -1,6 +1,5 @@
 streamlit
 google-genai
-groq
 python-docx
 requests
 supabase
