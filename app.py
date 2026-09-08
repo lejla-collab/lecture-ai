@@ -1,5 +1,6 @@
 import io
 import json
+import math
 import os
 import random
 import re
@@ -13,10 +14,8 @@ import requests
 import streamlit as st
 from google import genai
 from groq import Groq
-from supabase import Client, create_client
-import math
 from pydub import AudioSegment
-from moviepy.editor import AudioFileClip
+from supabase import Client, create_client
 
 # ------------------------------------------------------------------------------
 # 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ
@@ -94,7 +93,7 @@ if "is_correct" not in st.session_state:
 # ------------------------------------------------------------------------------
 def extract_youtube_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
-    if parsed.hostname in ("[www.youtube.com](https://www.youtube.com)", "youtube.com"):
+    if parsed.hostname in ("www.youtube.com", "youtube.com"):
         if parsed.path == "/watch":
             return parse_qs(parsed.query).get("v", [None])[0]
         if parsed.path.startswith(("/embed/", "/v/")):
@@ -109,7 +108,7 @@ def get_youtube_transcript_or_audio(video_url: str) -> str:
     if not api_key:
         raise Exception("Не найден SUPADATA_API_KEY в настройках st.secrets.")
 
-    url = f"[https://api.supadata.ai/v1/youtube/transcript?url=](https://api.supadata.ai/v1/youtube/transcript?url=){video_url}"
+    url = f"https://api.supadata.ai/v1/youtube/transcript?url={video_url}"
     headers = {"x-api-key": api_key}
 
     response = requests.get(url, headers=headers)
@@ -219,30 +218,30 @@ class LectureProcessor:
         if file_size <= MAX_FILE_SIZE_BYTES:
             return self._transcribe_file(file_path)
 
-        st.warning("⚠️ Файл больше 18 МБ. Нарезаем аудио на фрагменты через MoviePy...")
+        st.warning("⚠️ Файл больше 18 МБ. Нарезаем аудио на фрагменты с помощью Pydub...")
 
         try:
-            audio_clip = AudioFileClip(file_path)
-            duration = audio_clip.duration  # Длительность в секундах
+            # Загрузка аудио через pydub
+            audio = AudioSegment.from_file(file_path)
+            duration_ms = len(audio)  # Длительность в миллисекундах
 
-            # Нарезаем по 10 минут (600 секунд)
-            chunk_duration = 10 * 60
-            total_chunks = math.ceil(duration / chunk_duration)
+            # Нарезаем по 10 минут (600 000 мс)
+            chunk_duration_ms = 10 * 60 * 1000
+            total_chunks = math.ceil(duration_ms / chunk_duration_ms)
 
             full_transcript = []
             progress_bar = st.progress(0)
 
             for i in range(total_chunks):
-                start_sec = i * chunk_duration
-                end_sec = min((i + 1) * chunk_duration, duration)
+                start_ms = i * chunk_duration_ms
+                end_ms = min((i + 1) * chunk_duration_ms, duration_ms)
 
-                sub_clip = audio_clip.subclip(start_sec, end_sec)
+                chunk = audio[start_ms:end_ms]
 
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_chunk:
                     chunk_path = tmp_chunk.name
 
-                sub_clip.write_audiofile(chunk_path, bitrate="128k", logger=None)
-                sub_clip.close()
+                chunk.export(chunk_path, format="mp3", bitrate="128k")
 
                 try:
                     part_text = self._transcribe_file(chunk_path)
@@ -254,7 +253,6 @@ class LectureProcessor:
 
                 progress_bar.progress((i + 1) / total_chunks)
 
-            audio_clip.close()
             progress_bar.empty()
             return "\n\n".join(full_transcript)
 
@@ -348,6 +346,7 @@ class LectureProcessor:
                 st.warning(f"⚠️ Ошибка считывания структуры викторины: {e}")
 
         return summary_md, quiz_json
+
 # ------------------------------------------------------------------------------
 # 5. ИНТЕРАКТИВНЫЙ ИГРОВОЙ МОДУЛЬ (QUIZ)
 # ------------------------------------------------------------------------------
@@ -667,7 +666,7 @@ def main():
                 try:
                     with st.spinner("🎧 Расшифровка аудиозаписи (Groq Whisper)..."):
                         raw_transcript = processor.transcribe_audio(temp_audio_path)
-                    
+
                     if not raw_transcript or not raw_transcript.strip():
                         st.error("❌ Не удалось распознать текст из аудиофайла.")
                         st.stop()
