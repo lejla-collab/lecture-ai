@@ -4,6 +4,4 @@ groq
 python-docx
 requests
 supabase
-authlib
 pydub
-moviepy
