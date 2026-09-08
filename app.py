@@ -12,6 +12,7 @@ import requests
 import streamlit as st
 from google import genai
 from supabase import Client, create_client
+import mimetypes
 
 # ------------------------------------------------------------------------------
 # 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ
@@ -179,8 +180,26 @@ class LectureProcessor:
         self.gemini_model = "gemini-2.5-flash"
 
     def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
-        """Загрузка файла прямо в Gemini API без нарезки и без FFmpeg"""
         st.info("📤 Загрузка аудиофайла на сервер Gemini...")
+        
+        # Автоматически определяем MIME-тип файла
+        mime_type, _ = mimetypes.guess_type(file_path)
+        if not mime_type:
+            mime_type = "audio/mpeg" # Резервное значение для аудио
+
+        # Передаем mime_type явно в Gemini API
+        uploaded_file = self.gemini_client.files.upload(
+            file=file_path,
+            mime_type=mime_type
+        )
+        
+        with st.spinner("⏳ Google обрабатывает аудиофайл..."):
+            while uploaded_file.state.name == "PROCESSING":
+                time.sleep(2)
+                uploaded_file = self.gemini_client.files.get(name=uploaded_file.name)
+                
+            if uploaded_file.state.name == "FAILED":
+                raise RuntimeError("Ошибка при обработке аудио на стороне Gemini API.")
         
         uploaded_file = self.gemini_client.files.upload(file=file_path)
         
