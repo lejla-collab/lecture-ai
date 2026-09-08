@@ -256,11 +256,27 @@ class LectureProcessor:
 ===QUIZ_JSON_END===
 """
 
-        with st.spinner("🤖 Gemini формирует подробный конспект и викторину..."):
-            response = self.gemini_client.models.generate_content(
-                model=self.gemini_model,
-                contents=[uploaded_file, prompt]
-            )
+        try:
+            with st.spinner("🤖 Gemini формирует подробный конспект..."):
+                response = self.gemini_client.models.generate_content(
+                    model=self.gemini_model,
+                    contents=[uploaded_file, prompt]
+                )
+        except Exception as e:
+            if "503" in str(e) or "UNAVAILABLE" in str(e):
+                st.warning("⚠️ Основная модель перегружена. Переключаемся на резервную модель...")
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model="gemini-2.0-flash",
+                        contents=[uploaded_file, prompt]
+                    )
+                except Exception:
+                    response = self.gemini_client.models.generate_content(
+                        model="gemini-1.5-flash",
+                        contents=[uploaded_file, prompt]
+                    )
+            else:
+                raise e
 
         try:
             self.gemini_client.files.delete(name=uploaded_file.name)
