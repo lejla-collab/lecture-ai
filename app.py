@@ -1,3 +1,13 @@
+import sys
+
+# Временная заплатка для Python 3.13+ / 3.14 для поддержки pydub
+try:
+    import audioop
+except ImportError:
+    import pyaudioop
+
+    sys.modules["audioop"] = pyaudioop
+    
 import io
 import json
 import os
