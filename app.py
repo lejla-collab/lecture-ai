@@ -179,15 +179,13 @@ class LectureProcessor:
         self.gemini_client = genai.Client(api_key=gemini_key)
         self.gemini_model = "gemini-2.5-flash"
 
-def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
+    def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
         st.info("📤 Загрузка аудиофайла на сервер Gemini...")
         
-        # Определяем MIME-тип
         mime_type, _ = mimetypes.guess_type(file_path)
         if not mime_type:
             mime_type = "audio/mpeg"
 
-        # Передаем mime_type через объект types.UploadFileConfig
         from google.genai import types
         
         uploaded_file = self.gemini_client.files.upload(
@@ -348,7 +346,6 @@ def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dic
                 st.warning(f"⚠️ Ошибка парсинга викторины: {e}")
 
         return summary_md, quiz_json, "Аудиозапись обработана напрямую через Gemini API."
-
 # ------------------------------------------------------------------------------
 # 5. ИГРОВОЙ МОДУЛЬ (QUIZ)
 # ------------------------------------------------------------------------------
