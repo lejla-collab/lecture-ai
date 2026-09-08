@@ -256,6 +256,7 @@ class LectureProcessor:
 ===QUIZ_JSON_END===
 """
 
+# Пробуем основную модель, если она перегружена (503) — автоматический переход на резервные
         try:
             with st.spinner("🤖 Gemini формирует подробный конспект..."):
                 response = self.gemini_client.models.generate_content(
@@ -272,7 +273,7 @@ class LectureProcessor:
                     )
                 except Exception:
                     response = self.gemini_client.models.generate_content(
-                        model="gemini-1.5-flash",
+                        model="gemini-2.0-flash-lite",
                         contents=[uploaded_file, prompt]
                     )
             else:
