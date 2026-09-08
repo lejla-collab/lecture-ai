@@ -6,3 +6,4 @@ requests
 supabase
 authlib
 pydub
+moviepy
