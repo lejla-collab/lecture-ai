@@ -4,4 +4,3 @@ groq
 python-docx
 requests
 supabase
-pydub
