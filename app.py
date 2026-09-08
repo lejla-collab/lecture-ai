@@ -1,20 +1,16 @@
 import io
 import json
-import math
 import os
-import random
 import re
 import tempfile
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 import docx
 import requests
 import streamlit as st
 from google import genai
-from groq import Groq
-from pydub import AudioSegment
 from supabase import Client, create_client
 
 # ------------------------------------------------------------------------------
@@ -45,8 +41,6 @@ GROQ_API_KEY = st.secrets.get("GROQ_API_KEY", "")
 GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "")
 SUPABASE_URL = st.secrets.get("SUPABASE_URL", "")
 SUPABASE_KEY = st.secrets.get("SUPABASE_KEY", "")
-
-MAX_FILE_SIZE_BYTES = 18 * 1024 * 1024
 
 supabase: Optional[Client] = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -89,7 +83,7 @@ if "is_correct" not in st.session_state:
     st.session_state.is_correct = None
 
 # ------------------------------------------------------------------------------
-# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ И БАЗА ДАННЫХ
+# 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
 # ------------------------------------------------------------------------------
 def extract_youtube_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
@@ -103,7 +97,7 @@ def extract_youtube_id(url: str) -> Optional[str]:
     return None
 
 
-def get_youtube_transcript_or_audio(video_url: str) -> str:
+def get_youtube_transcript(video_url: str) -> str:
     api_key = st.secrets.get("SUPADATA_API_KEY", "")
     if not api_key:
         raise Exception("Не найден SUPADATA_API_KEY в настройках st.secrets.")
@@ -121,24 +115,6 @@ def get_youtube_transcript_or_audio(video_url: str) -> str:
         raise Exception("У этого видео нет доступных субтитров.")
 
     return " ".join([item.get("text", "") for item in content])
-
-
-def call_gemini_with_retry(client: genai.Client, model: str, prompt: str, retries: int = 5, base_delay: int = 3) -> str:
-    """Экспоненциальная задержка + Jitter для защиты от ограничений и ошибок сети"""
-    for attempt in range(retries):
-        try:
-            response = client.models.generate_content(model=model, contents=prompt)
-            if response and response.text:
-                return response.text
-        except Exception as e:
-            err_msg = str(e)
-            if any(code in err_msg for code in ["503", "UNAVAILABLE", "429", "RESOURCE_EXHAUSTED"]):
-                if attempt < retries - 1:
-                    sleep_time = (base_delay * (2 ** attempt)) + random.uniform(0.5, 1.5)
-                    time.sleep(sleep_time)
-                    continue
-            raise e
-    raise RuntimeError("Не удалось получить стабильный ответ от Gemini API после нескольких попыток.")
 
 
 def create_docx_bytes(markdown_text: str) -> bytes:
@@ -179,7 +155,7 @@ def save_lecture_to_db(user_email: str, title: str, summary_md: str, quiz_json: 
             "youtube_url": youtube_url
         }
         supabase.table("lectures").insert(data).execute()
-        st.toast("💾 Конспект автоматически сохранен в вашем Личном Кабинете!", icon="✅")
+        st.toast("💾 Конспект сохранен в Личном Кабинете!", icon="✅")
     except Exception as e:
         st.error(f"Ошибка сохранения в базу данных: {e}")
 
@@ -195,101 +171,52 @@ def load_user_lectures(user_email: str):
         return []
 
 # ------------------------------------------------------------------------------
-# 4. ЛОГИКА ОБРАБОТКИ ЛЕКЦИИ (LECTURE PROCESSOR)
+# 4. ЛОГИКА ОБРАБОТКИ ЛЕКЦИИ (БЕЗ FFmpeg И PYDUB)
 # ------------------------------------------------------------------------------
 class LectureProcessor:
-    def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
-        self.groq_client = Groq(api_key=groq_key)
+    def __init__(self, gemini_key: str = GEMINI_API_KEY):
         self.gemini_client = genai.Client(api_key=gemini_key)
         self.gemini_model = "gemini-2.5-flash"
 
-    def _transcribe_file(self, file_path: str) -> str:
-        with open(file_path, "rb") as audio_file:
-            transcription = self.groq_client.audio.transcriptions.create(
-                file=(os.path.basename(file_path), audio_file.read()),
-                model="whisper-large-v3",
-                response_format="text",
-            )
-        return str(transcription)
+    def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
+        """Загрузка файла прямо в Gemini API без нарезки и без FFmpeg"""
+        st.info("📤 Загрузка аудиофайла на сервер Gemini...")
+        
+        uploaded_file = self.gemini_client.files.upload(file=file_path)
+        
+        with st.spinner("⏳ Google обрабатывает аудиофайл..."):
+            while uploaded_file.state.name == "PROCESSING":
+                time.sleep(2)
+                uploaded_file = self.gemini_client.files.get(name=uploaded_file.name)
+                
+            if uploaded_file.state.name == "FAILED":
+                raise RuntimeError("Ошибка при обработке аудио на стороне Gemini API.")
 
-    def transcribe_audio(self, file_path: str) -> str:
-        file_size = os.path.getsize(file_path)
-
-        if file_size <= MAX_FILE_SIZE_BYTES:
-            return self._transcribe_file(file_path)
-
-        st.warning("⚠️ Файл больше 18 МБ. Нарезаем аудио на фрагменты с помощью Pydub...")
-
-        try:
-            # Загрузка аудио через pydub
-            audio = AudioSegment.from_file(file_path)
-            duration_ms = len(audio)  # Длительность в миллисекундах
-
-            # Нарезаем по 10 минут (600 000 мс)
-            chunk_duration_ms = 10 * 60 * 1000
-            total_chunks = math.ceil(duration_ms / chunk_duration_ms)
-
-            full_transcript = []
-            progress_bar = st.progress(0)
-
-            for i in range(total_chunks):
-                start_ms = i * chunk_duration_ms
-                end_ms = min((i + 1) * chunk_duration_ms, duration_ms)
-
-                chunk = audio[start_ms:end_ms]
-
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_chunk:
-                    chunk_path = tmp_chunk.name
-
-                chunk.export(chunk_path, format="mp3", bitrate="128k")
-
-                try:
-                    part_text = self._transcribe_file(chunk_path)
-                    if part_text.strip():
-                        full_transcript.append(part_text.strip())
-                finally:
-                    if os.path.exists(chunk_path):
-                        os.remove(chunk_path)
-
-                progress_bar.progress((i + 1) / total_chunks)
-
-            progress_bar.empty()
-            return "\n\n".join(full_transcript)
-
-        except Exception as e:
-            st.error(f"❌ Ошибка при обработке аудиофайла: {e}")
-            raise e
-
-    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False) -> Tuple[str, dict]:
-        lang_instructions: Dict[str, str] = {
-            "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
+        lang_instructions = {
+            "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке.",
             "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
             "ru": "Составь весь материал СТРОГО на русском языке.",
             "en": "Составь весь материал СТРОГО на английском языке (English).",
         }
         instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
-        source_prompt = f"Ссылка/текст лекции:\n{text_or_url}"
 
         prompt = f"""
 Ты — высококлассный академический эксперт, профессор и методист.
 {instruction}
 
-Твоя задача — тщательно проанализировать расшифровку лекции ниже и сделать из неё ИДЕАЛЬНЫЙ, ПОДРОБНЫЙ, ОБЪЁМНЫЙ КОНСПЕКТ и ТЕСТОВЫЕ ИГРЫ.
+Твоя задача — тщательно проанализировать аудиозапись лекции, сделать из неё ИДЕАЛЬНЫЙ, ПОДРОБНЫЙ, ОБЪЁМНЫЙ КОНСПЕКТ и ТЕСТОВЫЕ ИГРЫ.
 
 ТРЕБОВАНИЯ К КОНСПЕКТУ:
 1. **Заголовок**: Начни с яркого заголовка первой категории `# Название темы`.
-2. **Полнота и дополнение знаний**: Не просто пересказывай текст. Если в речи спикера есть недосказанности, пропущенные определения, формулировки или сложные термины — ДОПОЛНИ их профессиональной, понятной информацией из своих энциклопедических знаний, чтобы конспект стал на 100% полноценным учебным пособием.
+2. **Полнота и дополнение знаний**: Не просто пересказывай. Если в речи спикера есть недосказанности, пропущенные определения, формулировки или сложные термины — ДОПОЛНИ их профессиональной информацией из своих знаний.
 3. **Структура**:
    - 📌 **Краткая аннотация**: О чем лекция и ключевой вывод.
-   - 📚 **Разбор основных разделов**: Подробный текст с подзаголовками (`##`), маркированными списками и выделением **жирным шрифтом** главных терминов и дат.
-   - 📊 **Сравнительная таблица / Кластер**: Используй таблицы Markdown для наглядности.
-   - 💡 **Примеры и практическое применение**: Как эти знания применяются на практике.
+   - 📚 **Разбор основных разделов**: Подробный текст с подзаголовками (`##`), маркированными списками и выделением **жирным шрифтом**.
+   - 📊 **Сравнительная таблица**: Используй таблицы Markdown.
+   - 💡 **Примеры и практическое применение**.
 
 СТРУКТУРА JSON ДЛЯ ВИКТОРИНЫ (В САМОМ КОНЦЕ ОТВЕТА):
-После завершения конспекта выведи специальный блок JSON для проверки знаний.
-
-ОБЯЗАТЕЛЬНАЯ СТРУКТУРА ОТВЕТА:
-[Текст подробного конспекта в Markdown]
+Выведи блок JSON для проверки знаний в конце:
 
 ===QUIZ_JSON_START===
 {{
@@ -318,21 +245,86 @@ class LectureProcessor:
   ]
 }}
 ===QUIZ_JSON_END===
-
-Количество вопросов: block1 (от 5 до 10 вопросов), block2 (5 вопросов), block3 (5 вопросов).
-
-Исходный текст лекции:
-{source_prompt}
 """
-        try:
-            raw_response = call_gemini_with_retry(self.gemini_client, self.gemini_model, prompt)
-        except Exception as e:
-            raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
 
+        with st.spinner("🤖 Gemini формирует подробный конспект и викторину..."):
+            response = self.gemini_client.models.generate_content(
+                model=self.gemini_model,
+                contents=[uploaded_file, prompt]
+            )
+
+        # Удаление временного файла из Gemini Storage
+        try:
+            self.gemini_client.files.delete(name=uploaded_file.name)
+        except Exception:
+            pass
+
+        return self._parse_gemini_response(response.text)
+
+    def process_text_or_transcript(self, text_content: str, target_lang: str) -> Tuple[str, dict]:
+        lang_instructions = {
+            "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке.",
+            "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
+            "ru": "Составь весь материал СТРОГО на русском языке.",
+            "en": "Составь весь материал СТРОГО на английском языке (English).",
+        }
+        instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
+
+        prompt = f"""
+Ты — высококлассный академический эксперт, профессор и методист.
+{instruction}
+
+Твоя задача — проанализировать расшифровку лекции и сделать из неё ИДЕАЛЬНЫЙ КОНСПЕКТ и ТЕСТОВЫЕ ИГРЫ.
+
+ТРЕБОВАНИЯ К КОНСПЕКТУ:
+1. **Заголовок**: `# Название темы`.
+2. **Полнота**: Дополни пропущенные термины и формулировки.
+3. **Структура**: Аннотация, Разделы (`##`), Таблица Markdown, Примеры.
+
+СТРУКТУРА JSON В КОНЦЕ:
+===QUIZ_JSON_START===
+{{
+  "block1": [
+    {{
+      "question": "Вопрос?",
+      "options": ["A", "B", "C", "D"],
+      "correct_index": 0,
+      "explanation": "Объяснение"
+    }}
+  ],
+  "block2": [
+    {{
+      "question": "Пропуск [ ... ]",
+      "options": ["1", "2", "3", "4"],
+      "correct_index": 0,
+      "explanation": "Объяснение"
+    }}
+  ],
+  "block3": [
+    {{
+      "statement": "Утверждение",
+      "is_true": true,
+      "explanation": "Объяснение"
+    }}
+  ]
+}}
+===QUIZ_JSON_END===
+
+Текст лекции:
+{text_content}
+"""
+        response = self.gemini_client.models.generate_content(
+            model=self.gemini_model,
+            contents=prompt
+        )
+        summary_md, quiz_json, _ = self._parse_gemini_response(response.text)
+        return summary_md, quiz_json
+
+    def _parse_gemini_response(self, raw_response: str) -> Tuple[str, dict, str]:
         summary_md = raw_response
         quiz_json = {"block1": [], "block2": [], "block3": []}
 
-        if raw_response and "===QUIZ_JSON_START===" in raw_response and "===QUIZ_JSON_END===" in raw_response:
+        if "===QUIZ_JSON_START===" in raw_response and "===QUIZ_JSON_END===" in raw_response:
             parts = raw_response.split("===QUIZ_JSON_START===")
             summary_md = parts[0].strip()
             json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
@@ -343,12 +335,12 @@ class LectureProcessor:
             try:
                 quiz_json = json.loads(json_str)
             except Exception as e:
-                st.warning(f"⚠️ Ошибка считывания структуры викторины: {e}")
+                st.warning(f"⚠️ Ошибка парсинга викторины: {e}")
 
-        return summary_md, quiz_json
+        return summary_md, quiz_json, "Аудиозапись обработана напрямую через Gemini API."
 
 # ------------------------------------------------------------------------------
-# 5. ИНТЕРАКТИВНЫЙ ИГРОВОЙ МОДУЛЬ (QUIZ)
+# 5. ИГРОВОЙ МОДУЛЬ (QUIZ)
 # ------------------------------------------------------------------------------
 def render_quiz_game():
     st.subheader("🎯 Проверка знаний")
@@ -369,19 +361,9 @@ def render_quiz_game():
         user_score = st.session_state.total_score
         perc = int((user_score / max_score) * 100) if max_score > 0 else 0
 
-        st.markdown(f"""
-        ### 🏆 Все 3 блока успешно пройдены!
-        Ваш итоговый результат: **{user_score} из {max_score} баллов** (**{perc}%**).
-        """)
+        st.markdown(f"### 🏆 Итоговый результат: **{user_score} из {max_score} баллов** (**{perc}%**)")
 
-        if perc >= 80:
-            st.success("🌟 Потрясающе! Вы отлично усвоили лекционный материал!")
-        elif perc >= 50:
-            st.warning("👍 Хорошая работа! Но стоит еще раз прочитать некоторые фрагменты.")
-        else:
-            st.error("📚 Рекомендуем повторно перечитать конспект лекции.")
-
-        if st.button("🔄 Пройти проверку знаний заново", type="primary"):
+        if st.button("🔄 Пройти тест заново", type="primary"):
             st.session_state.current_block = 1
             st.session_state.b1_idx = 0
             st.session_state.b2_idx = 0
@@ -393,12 +375,12 @@ def render_quiz_game():
         return
 
     if curr_block == 1:
-        st.info("📌 **Блок 1 из 3: Вопросы по материалу**")
+        st.info("📌 **Блок 1 из 3: Вопросы с выбором ответа**")
         idx = st.session_state.b1_idx
         total_q = len(b1)
 
         if idx >= total_q:
-            st.success("🎉 Блок 1 завершен! Переходим к Блоку 2 (Квиз)...")
+            st.success("🎉 Блок 1 завершен!")
             if st.button("Перейти к Блоку 2 ➡️", type="primary"):
                 st.session_state.current_block = 2
                 st.session_state.show_explanation = False
@@ -411,7 +393,7 @@ def render_quiz_game():
 
         st.markdown(f"#### ❓ {item['question']}")
         selected = st.radio(
-            "Выберите вариант ответа:",
+            "Выберите вариант:",
             options=item["options"],
             key=f"b1_q_{idx}",
             disabled=st.session_state.show_explanation,
@@ -440,7 +422,7 @@ def render_quiz_game():
                 st.rerun()
 
     elif curr_block == 2:
-        st.info("📌 **Блок 2 из 3: Квиз с заполнением пропусков**")
+        st.info("📌 **Блок 2 из 3: Заполнение пропусков**")
         if not b2:
             st.warning("Нет вопросов для Блока 2.")
             return
@@ -449,44 +431,37 @@ def render_quiz_game():
             user_answers = []
             for i, q in enumerate(b2):
                 st.markdown(f"**Вопрос {i + 1}:** {q['question']}")
-                options = ["-- Нажмите, чтобы выбрать ответ --"] + q["options"]
+                options = ["-- Выберите ответ --"] + q["options"]
                 selected = st.selectbox(
-                    label=f"Выберите ответ для вопроса №{i + 1}:",
+                    label=f"Ответ №{i + 1}:",
                     options=options,
                     key=f"b2_select_{i}",
                     disabled=st.session_state.show_explanation
                 )
                 user_answers.append(selected)
-                st.write("")
 
-            submit_btn = st.form_submit_button("✅ Проверить ответы", type="primary", disabled=st.session_state.show_explanation)
+            submit_btn = st.form_submit_button("✅ Проверить все ответы", type="primary", disabled=st.session_state.show_explanation)
 
         if submit_btn:
-            if any(ans == "-- Нажмите, чтобы выбрать ответ --" for ans in user_answers):
-                st.warning("⚠️ Пожалуйста, закройте все пробелы перед проверкой!")
+            if any(ans == "-- Выберите ответ --" for ans in user_answers):
+                st.warning("⚠️ Заполните все поля перед проверкой!")
             else:
                 st.session_state.b2_user_answers = user_answers
                 st.session_state.show_explanation = True
-                score_for_b2 = 0
-                for i, q in enumerate(b2):
-                    correct_text = q["options"][q["correct_index"]]
-                    if user_answers[i] == correct_text:
-                        score_for_b2 += 1
+                score_for_b2 = sum(1 for i, q in enumerate(b2) if user_answers[i] == q["options"][q["correct_index"]])
                 st.session_state.total_score += score_for_b2
                 st.rerun()
 
         if st.session_state.show_explanation:
-            st.markdown("### 📊 Результаты проверки Блока 2:")
             saved_answers = st.session_state.b2_user_answers
             for i, q in enumerate(b2):
                 correct_text = q["options"][q["correct_index"]]
                 user_ans = saved_answers[i] if i < len(saved_answers) else ""
                 if user_ans == correct_text:
-                    st.success(f"**Вопрос {i + 1}: ✅ Верно!**\n\nВаш ответ: *{user_ans}*")
+                    st.success(f"**Вопрос {i + 1}: ✅ Верно!** ({user_ans})")
                 else:
-                    st.error(f"**Вопрос {i + 1}: ❌ Неверно.**\n\nВаш ответ: *{user_ans}*\n\nПравильный ответ: **{correct_text}**")
-                st.info(f"💡 **Пояснение:** {q['explanation']}")
-                st.markdown("---")
+                    st.error(f"**Вопрос {i + 1}: ❌ Неверно.** Ваш ответ: *{user_ans}*. Правильный: **{correct_text}**")
+                st.info(f"💡 {q['explanation']}")
 
             if st.button("Перейти к Блоку 3 ➡️", type="primary"):
                 st.session_state.current_block = 3
@@ -494,13 +469,13 @@ def render_quiz_game():
                 st.rerun()
 
     elif curr_block == 3:
-        st.info("📌 **Блок 3 из 3: Верно или Неверно (True / False)**")
+        st.info("📌 **Блок 3 из 3: Верно или Неверно**")
         idx = st.session_state.b3_idx
         total_q = len(b3)
 
         if idx >= total_q:
-            st.success("🎉 Все блоки успешно пройдены!")
-            if st.button("Завершить и узнать результаты 🏆", type="primary"):
+            st.success("🎉 Все блоки завершены!")
+            if st.button("Посмотреть результаты 🏆", type="primary"):
                 st.session_state.current_block = 4
                 st.rerun()
             return
@@ -511,7 +486,7 @@ def render_quiz_game():
 
         st.markdown(f"#### 📢 {item['statement']}")
         user_choice = st.radio(
-            "Утверждение является истинным?",
+            "Утверждение верно?",
             options=["Верно", "Неверно"],
             key=f"b3_radio_{idx}",
             disabled=st.session_state.show_explanation,
@@ -541,18 +516,17 @@ def render_quiz_game():
                 st.rerun()
 
 # ------------------------------------------------------------------------------
-# 6. ЭКРАН «ЛИЧНЫЙ КАБИНЕТ»
+# 6. ЛИЧНЫЙ КАБИНЕТ
 # ------------------------------------------------------------------------------
 def render_dashboard(user_email: str):
     st.title("📂 Личный кабинет")
-    st.subheader(f"История конспектов пользователя: `{user_email}`")
+    st.subheader(f"Пользователь: `{user_email}`")
 
     if user_email == "guest@guest.com":
-        st.warning("⚠️ Вы вошли в режиме Гостя. История конспектов не сохраняется в базе данных.")
+        st.warning("⚠️ В режиме Гостя история конспектов не сохраняется.")
         return
 
     lectures = load_user_lectures(user_email)
-
     if not lectures:
         st.info("У вас пока нет сохраненных конспектов.")
         return
@@ -561,7 +535,6 @@ def render_dashboard(user_email: str):
         created_date = lec.get('created_at', '')[:10] if lec.get('created_at') else ''
         with st.expander(f"📖 {lec['title']} (Создано: {created_date})"):
             st.markdown(lec["summary_md"])
-            st.markdown("---")
             docx_bytes = create_docx_bytes(lec["summary_md"])
             st.download_button(
                 label="📄 Скачать .docx",
@@ -596,12 +569,10 @@ def main():
     if not is_logged_in:
         col1, col2, col3 = st.columns([1, 2, 1])
         with col2:
-            st.info("🔑 Авторизуйтесь, чтобы сохранять созданные конспекты.")
+            st.info("🔑 Авторизуйтесь для сохранения конспектов.")
             if st.button("🚀 Войти через Google", type="primary", use_container_width=True):
                 st.login()
-
             st.markdown("<p style='text-align: center; color: gray;'>или</p>", unsafe_allow_html=True)
-
             if st.button("👤 Продолжить как Гость", use_container_width=True):
                 st.session_state.guest_mode = True
                 st.rerun()
@@ -623,7 +594,7 @@ def main():
         st.markdown("---")
         st.header("⚙️ Настройки")
         selected_lang = st.selectbox(
-            "Язык итогового конспекта",
+            "Язык конспекта",
             options=["auto", "kk", "ru", "en"],
             format_func=lambda x: {
                 "auto": "🌐 Автоопределение",
@@ -639,11 +610,11 @@ def main():
         render_dashboard(user_email)
 
     with main_tab1:
-        st.title("🎓 Lecture AI — Генерация & Тестирование")
-        st.caption("Автоматическое создание наглядных конспектов и интерактивной проверки знаний.")
+        st.title("🎓 Lecture AI — Генератор Конспектов")
+        st.caption("Загрузите аудиозапись или ссылку на YouTube.")
 
         source_type = st.radio(
-            "Выберите способ загрузки лекции:",
+            "Выберите источник:",
             ("Загрузить аудиофайл", "Ссылка на YouTube"),
             horizontal=True,
         )
@@ -652,11 +623,11 @@ def main():
 
         if source_type == "Загрузить аудиофайл":
             uploaded_file = st.file_uploader(
-                "Загрузите аудиозапись лекции (MP3, WAV, M4A, OGG)",
+                "Загрузите аудиозапись (MP3, WAV, M4A, OGG)",
                 type=["mp3", "wav", "m4a", "ogg"],
             )
 
-            if uploaded_file and st.button("🚀 Начать обработку лекции", type="primary"):
+            if uploaded_file and st.button("🚀 Обработать аудиозапись", type="primary"):
                 with tempfile.NamedTemporaryFile(
                     delete=False, suffix=os.path.splitext(uploaded_file.name)[1]
                 ) as tmp_file:
@@ -664,25 +635,14 @@ def main():
                     temp_audio_path = tmp_file.name
 
                 try:
-                    with st.spinner("🎧 Расшифровка аудиозаписи (Groq Whisper)..."):
-                        raw_transcript = processor.transcribe_audio(temp_audio_path)
+                    summary_md, quiz_json, raw_transcript = processor.process_audio_file(
+                        temp_audio_path, selected_lang
+                    )
 
-                    if not raw_transcript or not raw_transcript.strip():
-                        st.error("❌ Не удалось распознать текст из аудиофайла.")
-                        st.stop()
-
-                    st.success("✅ Транскрибация завершена!")
-
-                    with st.spinner("🤖 Gemini формирует подробный конспект и проверяет знания..."):
-                        summary_md, quiz_json = processor.generate_content_and_quiz(
-                            text_or_url=raw_transcript, target_lang=selected_lang, is_youtube=False
-                        )
-
-                    st.session_state.summary_md = summary_md or ""
+                    st.session_state.summary_md = summary_md
                     st.session_state.quiz_block1 = quiz_json.get("block1", [])
                     st.session_state.quiz_block2 = quiz_json.get("block2", [])
                     st.session_state.quiz_block3 = quiz_json.get("block3", [])
-
                     st.session_state.raw_transcript = raw_transcript
                     st.session_state.current_youtube_url = None
 
@@ -692,7 +652,7 @@ def main():
                         if first_line:
                             lecture_title = first_line
 
-                    save_lecture_to_db(user_email, lecture_title, st.session_state.summary_md, quiz_json, raw_transcript)
+                    save_lecture_to_db(user_email, lecture_title, summary_md, quiz_json, raw_transcript)
 
                     st.session_state.current_block = 1
                     st.session_state.b1_idx = 0
@@ -710,16 +670,16 @@ def main():
                     if os.path.exists(temp_audio_path):
                         os.remove(temp_audio_path)
         else:
-            youtube_url = st.text_input("Вставьте ссылку на видео с YouTube:")
+            youtube_url = st.text_input("Вставьте ссылку на YouTube видео:")
 
-            if youtube_url.strip() and st.button("🚀 Начать обработку YouTube видео", type="primary"):
+            if youtube_url.strip() and st.button("🚀 Обработать YouTube видео", type="primary"):
                 try:
                     with st.spinner("📜 Получение субтитров из видео..."):
-                        transcript_text = get_youtube_transcript_or_audio(youtube_url)
+                        transcript_text = get_youtube_transcript(youtube_url)
 
-                    with st.spinner("🤖 Gemini анализирует текст и создает конспект и тесты..."):
-                        summary_md, quiz_json = processor.generate_content_and_quiz(
-                            text_or_url=transcript_text, target_lang=selected_lang, is_youtube=True
+                    with st.spinner("🤖 Gemini делает конспект и тесты..."):
+                        summary_md, quiz_json = processor.process_text_or_transcript(
+                            transcript_text, selected_lang
                         )
 
                     st.session_state.summary_md = summary_md
@@ -750,7 +710,7 @@ def main():
         if "summary_md" in st.session_state:
             st.markdown("---")
             tab_summary, tab_game, tab_transcript = st.tabs(
-                ["📄 Подробный конспект", "🎯 Проверка знаний", "📜 Исходный транскрипт"]
+                ["📄 Подробный конспект", "🎯 Проверка знаний", "📜 Исходный текст"]
             )
 
             with tab_summary:
@@ -760,7 +720,7 @@ def main():
                 st.markdown("---")
                 docx_file = create_docx_bytes(st.session_state.summary_md)
                 st.download_button(
-                    label="📄 Скачать конспект в формате Word (.docx)",
+                    label="📄 Скачать конспект (.docx)",
                     data=docx_file,
                     file_name="lecture_summary.docx",
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -770,7 +730,7 @@ def main():
                 render_quiz_game()
 
             with tab_transcript:
-                st.text_area("Распознанный исходный текст:", value=st.session_state.raw_transcript, height=350)
+                st.text_area("Распознанный текст:", value=st.session_state.raw_transcript, height=350)
 
 
 if __name__ == "__main__":
