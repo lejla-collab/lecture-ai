@@ -14,6 +14,8 @@ import streamlit as st
 from google import genai
 from groq import Groq
 from supabase import Client, create_client
+import math
+from pydub import AudioSegment
 
 # ------------------------------------------------------------------------------
 # 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ
@@ -196,10 +198,12 @@ def load_user_lectures(user_email: str):
 # 4. ЛОГИКА ОБРАБОТКИ ЛЕКЦИИ (LECTURE PROCESSOR)
 # ------------------------------------------------------------------------------
 class LectureProcessor:
-    def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
+
+    def __init__(
+        self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY
+    ):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        # Исправлено: использование актуальной модели Gemini
         self.gemini_model = "gemini-2.5-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
@@ -213,47 +217,78 @@ class LectureProcessor:
 
     def transcribe_audio(self, file_path: str) -> str:
         file_size = os.path.getsize(file_path)
+
         if file_size <= MAX_FILE_SIZE_BYTES:
             return self._transcribe_file(file_path)
 
-        st.warning("⚠️ Файл больше 18 МБ. Разбиваем на части для отправки в Groq...")
-        full_transcript = []
-        chunk_size = MAX_FILE_SIZE_BYTES
-        total_chunks = (file_size // chunk_size) + 1
-        progress_bar = st.progress(0)
+        st.warning(
+            "⚠️ Файл больше 18 МБ. Разбиваем аудио на корректные фрагменты..."
+        )
 
-        with open(file_path, "rb") as f:
-            idx = 0
-            while True:
-                chunk_data = f.read(chunk_size)
-                if not chunk_data:
-                    break
+        try:
+            file_ext = os.path.splitext(file_path)[1].replace(".", "").lower()
+            if not file_ext:
+                file_ext = "mp3"
 
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as tmp_chunk:
-                    tmp_chunk.write(chunk_data)
+            audio = AudioSegment.from_file(file_path, format=file_ext)
+
+            # Нарезаем по 10 минут (600 000 мс), чтобы каждый кусок имел валидные заголовки
+            chunk_length_ms = 10 * 60 * 1000
+            total_chunks = math.ceil(len(audio) / chunk_length_ms)
+
+            full_transcript = []
+            progress_bar = st.progress(0)
+
+            for i in range(total_chunks):
+                start_time = i * chunk_length_ms
+                end_time = (i + 1) * chunk_length_ms
+                chunk_audio = audio[start_time:end_time]
+
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=".mp3"
+                ) as tmp_chunk:
+                    chunk_audio.export(
+                        tmp_chunk.name, format="mp3", bitrate="128k"
+                    )
                     chunk_path = tmp_chunk.name
 
                 try:
                     part_text = self._transcribe_file(chunk_path)
-                    full_transcript.append(part_text)
+                    if part_text.strip():
+                        full_transcript.append(part_text.strip())
                 finally:
                     if os.path.exists(chunk_path):
                         os.remove(chunk_path)
 
-                idx += 1
-                progress_bar.progress(min(idx / total_chunks, 1.0))
+                progress_bar.progress((i + 1) / total_chunks)
 
-        progress_bar.empty()
-        return "\n".join(full_transcript)
+            progress_bar.empty()
+            return "\n\n".join(full_transcript)
 
-    def generate_content_and_quiz(self, text_or_url: str, target_lang: str, is_youtube: bool = False) -> Tuple[str, dict]:
+        except Exception as e:
+            st.error(f"❌ Ошибка при обработке аудиофайла через Pydub: {e}")
+            raise e
+
+    def generate_content_and_quiz(
+        self, text_or_url: str, target_lang: str, is_youtube: bool = False
+    ) -> Tuple[str, dict]:
         lang_instructions: Dict[str, str] = {
-            "auto": "Определи язык лекции и составь весь материал СТРОГО на этом же языке (KK / RU / EN).",
-            "kk": "Составь весь материал СТРОГО на казахском языке (Қазақ тілінде).",
+            "auto": (
+                "Определи язык лекции и составь весь материал СТРОГО на этом"
+                " же языке (KK / RU / EN)."
+            ),
+            "kk": (
+                "Составь весь материал СТРОГО на казахском языке (Қазақ"
+                " тілінде)."
+            ),
             "ru": "Составь весь материал СТРОГО на русском языке.",
-            "en": "Составь весь материал СТРОГО на английском языке (English).",
+            "en": (
+                "Составь весь материал СТРОГО на английском языке (English)."
+            ),
         }
-        instruction = lang_instructions.get(target_lang, lang_instructions["auto"])
+        instruction = lang_instructions.get(
+            target_lang, lang_instructions["auto"]
+        )
         source_prompt = f"Ссылка/текст лекции:\n{text_or_url}"
 
         prompt = f"""
@@ -311,19 +346,26 @@ class LectureProcessor:
 {source_prompt}
 """
         try:
-            raw_response = call_gemini_with_retry(self.gemini_client, self.gemini_model, prompt)
+            raw_response = call_gemini_with_retry(
+                self.gemini_client, self.gemini_model, prompt
+            )
         except Exception as e:
-            raise RuntimeError(f"Не удалось получить ответ от Gemini API: {e}")
+            raise RuntimeError(
+                f"Не удалось получить ответ от Gemini API: {e}"
+            )
 
         summary_md = raw_response
         quiz_json = {"block1": [], "block2": [], "block3": []}
 
-        if raw_response and "===QUIZ_JSON_START===" in raw_response and "===QUIZ_JSON_END===" in raw_response:
+        if (
+            raw_response
+            and "===QUIZ_JSON_START===" in raw_response
+            and "===QUIZ_JSON_END===" in raw_response
+        ):
             parts = raw_response.split("===QUIZ_JSON_START===")
             summary_md = parts[0].strip()
             json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
-            
-            # Очистка от возможных тэгов ```json ... ```
+
             json_str = re.sub(r"^```json\s*", "", json_str)
             json_str = re.sub(r"\s*```$", "", json_str)
 
@@ -333,7 +375,6 @@ class LectureProcessor:
                 st.warning(f"⚠️ Ошибка считывания структуры викторины: {e}")
 
         return summary_md, quiz_json
-
 # ------------------------------------------------------------------------------
 # 5. ИНТЕРАКТИВНЫЙ ИГРОВОЙ МОДУЛЬ (QUIZ)
 # ------------------------------------------------------------------------------
