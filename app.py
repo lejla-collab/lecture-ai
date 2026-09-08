@@ -264,16 +264,16 @@ class LectureProcessor:
                     contents=[uploaded_file, prompt]
                 )
         except Exception as e:
-            if "503" in str(e) or "UNAVAILABLE" in str(e):
-                st.warning("⚠️ Основная модель перегружена. Переключаемся на резервную модель...")
+            if "503" in str(e) or "UNAVAILABLE" in str(e) or "404" in str(e):
+                st.warning("⚠️ Основная модель недоступна или перегружена. Переключаемся на резервную модель...")
                 try:
                     response = self.gemini_client.models.generate_content(
-                        model="gemini-2.0-flash",
+                        model="gemini-3.5-flash",
                         contents=[uploaded_file, prompt]
                     )
                 except Exception:
                     response = self.gemini_client.models.generate_content(
-                        model="gemini-2.0-flash-lite",
+                        model="gemini-3.5-flash-lite",
                         contents=[uploaded_file, prompt]
                     )
             else:
