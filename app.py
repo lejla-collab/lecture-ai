@@ -179,29 +179,21 @@ class LectureProcessor:
         self.gemini_client = genai.Client(api_key=gemini_key)
         self.gemini_model = "gemini-2.5-flash"
 
-    def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
+def process_audio_file(self, file_path: str, target_lang: str) -> Tuple[str, dict, str]:
         st.info("📤 Загрузка аудиофайла на сервер Gemini...")
         
-        # Автоматически определяем MIME-тип файла
+        # Определяем MIME-тип
         mime_type, _ = mimetypes.guess_type(file_path)
         if not mime_type:
-            mime_type = "audio/mpeg" # Резервное значение для аудио
+            mime_type = "audio/mpeg"
 
-        # Передаем mime_type явно в Gemini API
+        # Передаем mime_type через объект types.UploadFileConfig
+        from google.genai import types
+        
         uploaded_file = self.gemini_client.files.upload(
             file=file_path,
-            mime_type=mime_type
+            config=types.UploadFileConfig(mime_type=mime_type)
         )
-        
-        with st.spinner("⏳ Google обрабатывает аудиофайл..."):
-            while uploaded_file.state.name == "PROCESSING":
-                time.sleep(2)
-                uploaded_file = self.gemini_client.files.get(name=uploaded_file.name)
-                
-            if uploaded_file.state.name == "FAILED":
-                raise RuntimeError("Ошибка при обработке аудио на стороне Gemini API.")
-        
-        uploaded_file = self.gemini_client.files.upload(file=file_path)
         
         with st.spinner("⏳ Google обрабатывает аудиофайл..."):
             while uploaded_file.state.name == "PROCESSING":
@@ -272,7 +264,6 @@ class LectureProcessor:
                 contents=[uploaded_file, prompt]
             )
 
-        # Удаление временного файла из Gemini Storage
         try:
             self.gemini_client.files.delete(name=uploaded_file.name)
         except Exception:
