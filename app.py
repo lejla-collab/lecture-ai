@@ -75,6 +75,9 @@ if "b2_idx" not in st.session_state:
 if "b3_idx" not in st.session_state:
     st.session_state.b3_idx = 0
 
+if "b2_user_answers" not in st.session_state:
+    st.session_state.b2_user_answers = []
+
 if "total_score" not in st.session_state:
     st.session_state.total_score = 0
 
@@ -88,7 +91,7 @@ if "is_correct" not in st.session_state:
 # ------------------------------------------------------------------------------
 def extract_youtube_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
-    if parsed.hostname in ("www.youtube.com", "youtube.com"):
+    if parsed.hostname in ("[www.youtube.com](https://www.youtube.com)", "youtube.com"):
         if parsed.path == "/watch":
             return parse_qs(parsed.query).get("v", [None])[0]
         if parsed.path.startswith(("/embed/", "/v/")):
@@ -103,7 +106,7 @@ def get_youtube_transcript_or_audio(video_url: str) -> str:
     if not api_key:
         raise Exception("Не найден SUPADATA_API_KEY в настройках st.secrets.")
 
-    url = f"https://api.supadata.ai/v1/youtube/transcript?url={video_url}"
+    url = f"[https://api.supadata.ai/v1/youtube/transcript?url=](https://api.supadata.ai/v1/youtube/transcript?url=){video_url}"
     headers = {"x-api-key": api_key}
 
     response = requests.get(url, headers=headers)
@@ -118,7 +121,7 @@ def get_youtube_transcript_or_audio(video_url: str) -> str:
     return " ".join([item.get("text", "") for item in content])
 
 
-def call_gemini_with_retry(client, model, prompt, retries=6, base_delay=3):
+def call_gemini_with_retry(client: genai.Client, model: str, prompt: str, retries: int = 5, base_delay: int = 3) -> str:
     """Экспоненциальная задержка + Jitter для защиты от ограничений и ошибок сети"""
     for attempt in range(retries):
         try:
@@ -184,7 +187,7 @@ def load_user_lectures(user_email: str):
         return []
     try:
         response = supabase.table("lectures").select("*").eq("user_email", user_email).order("created_at", desc=True).execute()
-        return response.data
+        return response.data or []
     except Exception as e:
         st.error(f"Ошибка загрузки истории: {e}")
         return []
@@ -196,8 +199,8 @@ class LectureProcessor:
     def __init__(self, groq_key: str = GROQ_API_KEY, gemini_key: str = GEMINI_API_KEY):
         self.groq_client = Groq(api_key=groq_key)
         self.gemini_client = genai.Client(api_key=gemini_key)
-        # Использование актуальной и рабочей модели Gemini 3.6 Flash
-        self.gemini_model = "gemini-3.6-flash"
+        # Исправлено: использование актуальной модели Gemini
+        self.gemini_model = "gemini-2.5-flash"
 
     def _transcribe_file(self, file_path: str) -> str:
         with open(file_path, "rb") as audio_file:
@@ -254,7 +257,7 @@ class LectureProcessor:
         source_prompt = f"Ссылка/текст лекции:\n{text_or_url}"
 
         prompt = f"""
-Ты — высококлассный академический эксперт, профессора и методист.
+Ты — высококлассный академический эксперт, профессор и методист.
 {instruction}
 
 Твоя задача — тщательно проанализировать расшифровку лекции ниже и сделать из неё ИДЕАЛЬНЫЙ, ПОДРОБНЫЙ, ОБЪЁМНЫЙ КОНСПЕКТ и ТЕСТОВЫЕ ИГРЫ.
@@ -319,6 +322,11 @@ class LectureProcessor:
             parts = raw_response.split("===QUIZ_JSON_START===")
             summary_md = parts[0].strip()
             json_str = parts[1].split("===QUIZ_JSON_END===")[0].strip()
+            
+            # Очистка от возможных тэгов ```json ... ```
+            json_str = re.sub(r"^```json\s*", "", json_str)
+            json_str = re.sub(r"\s*```$", "", json_str)
+
             try:
                 quiz_json = json.loads(json_str)
             except Exception as e:
@@ -365,6 +373,7 @@ def render_quiz_game():
             st.session_state.b1_idx = 0
             st.session_state.b2_idx = 0
             st.session_state.b3_idx = 0
+            st.session_state.b2_user_answers = []
             st.session_state.total_score = 0
             st.session_state.show_explanation = False
             st.rerun()
@@ -443,6 +452,7 @@ def render_quiz_game():
             if any(ans == "-- Нажмите, чтобы выбрать ответ --" for ans in user_answers):
                 st.warning("⚠️ Пожалуйста, закройте все пробелы перед проверкой!")
             else:
+                st.session_state.b2_user_answers = user_answers
                 st.session_state.show_explanation = True
                 score_for_b2 = 0
                 for i, q in enumerate(b2):
@@ -454,9 +464,10 @@ def render_quiz_game():
 
         if st.session_state.show_explanation:
             st.markdown("### 📊 Результаты проверки Блока 2:")
+            saved_answers = st.session_state.b2_user_answers
             for i, q in enumerate(b2):
                 correct_text = q["options"][q["correct_index"]]
-                user_ans = user_answers[i] if i < len(user_answers) else ""
+                user_ans = saved_answers[i] if i < len(saved_answers) else ""
                 if user_ans == correct_text:
                     st.success(f"**Вопрос {i + 1}: ✅ Верно!**\n\nВаш ответ: *{user_ans}*")
                 else:
@@ -534,7 +545,8 @@ def render_dashboard(user_email: str):
         return
 
     for lec in lectures:
-        with st.expander(f"📖 {lec['title']} (Создано: {lec['created_at'][:10]})"):
+        created_date = lec.get('created_at', '')[:10] if lec.get('created_at') else ''
+        with st.expander(f"📖 {lec['title']} (Создано: {created_date})"):
             st.markdown(lec["summary_md"])
             st.markdown("---")
             docx_bytes = create_docx_bytes(lec["summary_md"])
@@ -673,6 +685,7 @@ def main():
                     st.session_state.b1_idx = 0
                     st.session_state.b2_idx = 0
                     st.session_state.b3_idx = 0
+                    st.session_state.b2_user_answers = []
                     st.session_state.total_score = 0
                     st.session_state.show_explanation = False
 
@@ -712,6 +725,7 @@ def main():
                     st.session_state.b1_idx = 0
                     st.session_state.b2_idx = 0
                     st.session_state.b3_idx = 0
+                    st.session_state.b2_user_answers = []
                     st.session_state.total_score = 0
                     st.session_state.show_explanation = False
 
