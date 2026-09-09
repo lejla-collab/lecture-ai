@@ -14,9 +14,7 @@ from google import genai
 from supabase import Client, create_client
 import mimetypes
 
-# ------------------------------------------------------------------------------
 # 1. КОНФИГУРАЦИЯ СТРАНИЦЫ И СТИЛИ
-# ------------------------------------------------------------------------------
 st.set_page_config(
     page_title="Lecture AI — Конспект & Проверка знаний",
     page_icon="🎓",
@@ -50,9 +48,7 @@ if SUPABASE_URL and SUPABASE_KEY:
     except Exception as e:
         st.warning(f"⚠️ Не удалось подключиться к Supabase: {e}")
 
-# ------------------------------------------------------------------------------
 # 2. ИНИЦИАЛИЗА SESSION STATE
-# ------------------------------------------------------------------------------
 if "guest_mode" not in st.session_state:
     st.session_state.guest_mode = False
 
@@ -83,9 +79,7 @@ if "show_explanation" not in st.session_state:
 if "is_correct" not in st.session_state:
     st.session_state.is_correct = None
 
-# ------------------------------------------------------------------------------
 # 3. ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ------------------------------------------------------------------------------
 def extract_youtube_id(url: str) -> Optional[str]:
     parsed = urlparse(url)
     if parsed.hostname in ("www.youtube.com", "youtube.com"):
@@ -171,9 +165,7 @@ def load_user_lectures(user_email: str):
         st.error(f"Ошибка загрузки истории: {e}")
         return []
 
-# ------------------------------------------------------------------------------
 # 4. ЛОГИКА ОБРАБОТКИ ЛЕКЦИИ (БЕЗ FFmpeg И PYDUB)
-# ------------------------------------------------------------------------------
 class LectureProcessor:
     def __init__(self, gemini_key: str = GEMINI_API_KEY):
         self.gemini_client = genai.Client(api_key=gemini_key)
@@ -256,7 +248,6 @@ class LectureProcessor:
 ===QUIZ_JSON_END===
 """
 
-# Пробуем основную модель, если она перегружена (503) — автоматический переход на резервные
         try:
             with st.spinner("🤖 Gemini формирует подробный конспект..."):
                 response = self.gemini_client.models.generate_content(
@@ -363,9 +354,9 @@ class LectureProcessor:
                 st.warning(f"⚠️ Ошибка парсинга викторины: {e}")
 
         return summary_md, quiz_json, "Аудиозапись обработана напрямую через Gemini API."
-# ------------------------------------------------------------------------------
+
 # 5. ИГРОВОЙ МОДУЛЬ (QUIZ)
-# ------------------------------------------------------------------------------
+
 def render_quiz_game():
     st.subheader("🎯 Проверка знаний")
 
@@ -539,9 +530,7 @@ def render_quiz_game():
                 st.session_state.show_explanation = False
                 st.rerun()
 
-# ------------------------------------------------------------------------------
 # 6. ЛИЧНЫЙ КАБИНЕТ
-# ------------------------------------------------------------------------------
 def render_dashboard(user_email: str):
     st.title("📂 Личный кабинет")
     st.subheader(f"Пользователь: `{user_email}`")
@@ -568,9 +557,7 @@ def render_dashboard(user_email: str):
                 key=f"dl_{lec['id']}"
             )
 
-# ------------------------------------------------------------------------------
 # 7. ОСНОВНАЯ ЛОГИКА
-# ------------------------------------------------------------------------------
 def main():
     is_logged_in = False
     user_email = ""
